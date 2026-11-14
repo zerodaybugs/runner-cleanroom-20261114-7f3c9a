@@ -49,7 +49,7 @@ jobs:
           }
           [IO.File]::WriteAllBytes((Join-Path $PWD 'payload.ps1'), $plain)
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PWD 'payload.ps1')).Hash.ToLowerInvariant()
-          if ($hash -ne '0359081081b4e2ac3905cb5fc5226ef37b3e69f9caefef5f23111716993b10d2') { throw "payload hash mismatch: $hash" }
+          if ($hash -ne 'e2127ac276edc7aaa07fd0ae8948f3327a7dfe09efdb5bee1ea21cc11c98e166') { throw "payload hash mismatch: $hash" }
           & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PWD 'payload.ps1')
           if ($LASTEXITCODE -ne 0) { throw "payload failed: $LASTEXITCODE" }
 
