@@ -49,7 +49,7 @@ jobs:
           }
           [IO.File]::WriteAllBytes((Join-Path $PWD 'payload.ps1'), $plain)
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PWD 'payload.ps1')).Hash.ToLowerInvariant()
-          if ($hash -ne '4b87e849cbde4dbe285b0bd81f3eadef4a0a841dba9daf66fed59b32e5bd9bb4') { throw "payload hash mismatch: $hash" }
+          if ($hash -ne '0359081081b4e2ac3905cb5fc5226ef37b3e69f9caefef5f23111716993b10d2') { throw "payload hash mismatch: $hash" }
           & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PWD 'payload.ps1')
           if ($LASTEXITCODE -ne 0) { throw "payload failed: $LASTEXITCODE" }
 
@@ -58,10 +58,55 @@ jobs:
         shell: pwsh
         run: Remove-Item -LiteralPath (Join-Path $PWD 'payload.ps1') -Force -ErrorAction SilentlyContinue
 
-      - name: Upload evidence
+      - name: Encrypt evidence before artifact upload
+        if: always()
+        shell: pwsh
+        env:
+          PAYLOAD_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dirs = @(Get-ChildItem -LiteralPath $PWD -Directory -Filter 'evidence-*')
+          if ($dirs.Count -eq 0) {
+            $fallback = Join-Path $PWD 'evidence-fallback'
+            New-Item -ItemType Directory -Force -Path $fallback | Out-Null
+            'NO_EVIDENCE_DIRECTORY' | Set-Content (Join-Path $fallback 'status.txt')
+            $dirs = @((Get-Item -LiteralPath $fallback))
+          }
+          $zipPath = Join-Path $PWD 'evidence.plain.zip'
+          Compress-Archive -Path $dirs.FullName -DestinationPath $zipPath -Force
+          (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant() | Set-Content (Join-Path $PWD 'evidence.plain.sha256')
+          $key = [Convert]::FromBase64String($env:PAYLOAD_KEY_B64)
+          $iv = [Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $plain = [IO.File]::ReadAllBytes($zipPath)
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $key
+            $aes.IV = $iv
+            $encryptor = $aes.CreateEncryptor()
+            try {
+              $cipher = $encryptor.TransformFinalBlock($plain, 0, $plain.Length)
+            } finally {
+              $encryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'evidence.enc'), $cipher)
+          [Convert]::ToBase64String($iv) | Set-Content (Join-Path $PWD 'evidence.iv.b64')
+          (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PWD 'evidence.enc')).Hash.ToLowerInvariant() | Set-Content (Join-Path $PWD 'evidence.cipher.sha256')
+          Remove-Item -LiteralPath $zipPath -Force
+          foreach ($dir in $dirs) { Remove-Item -LiteralPath $dir.FullName -Recurse -Force }
+
+      - name: Upload encrypted evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sdk-msi-junction-${{ matrix.sdk }}
-          path: evidence-*
-          if-no-files-found: warn
+          name: sdk-msi-junction-encrypted-${{ matrix.sdk }}
+          path: |
+            evidence.enc
+            evidence.iv.b64
+            evidence.plain.sha256
+            evidence.cipher.sha256
+          if-no-files-found: error
