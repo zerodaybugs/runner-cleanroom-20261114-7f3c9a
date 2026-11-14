@@ -1,0 +1,99 @@
+name: Export Run8 Sealed Payload Key
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout current public export key
+        uses: actions/checkout@v4
+        with:
+          path: current
+
+      - name: Checkout exact Run 8 source
+        uses: actions/checkout@v4
+        with:
+          ref: a15fae9662e0f05b82f80e29c0418fa5c675e572
+          path: run8
+
+      - name: Re-wrap Run 8 payload key
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WRAPPING_KEY_B64)) { throw 'wrapping key missing' }
+
+          $wrappingKey = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
+          if ($wrappingKey.Length -ne 32) { throw 'wrapping key length invalid' }
+          $run8 = Join-Path $PWD 'run8'
+          $current = Join-Path $PWD 'current'
+          $wrappedPrivate = [IO.File]::ReadAllBytes((Join-Path $run8 'bootstrap/private.pem.enc'))
+          $wrapIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $run8 'bootstrap/private.iv.hex') -Raw).Trim())
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $wrappingKey
+            $aes.IV = $wrapIv
+            $decryptor = $aes.CreateDecryptor()
+            try {
+              $privatePemBytes = $decryptor.TransformFinalBlock($wrappedPrivate, 0, $wrappedPrivate.Length)
+            } finally {
+              $decryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+
+          $bootstrapRsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $bootstrapRsa.ImportFromPem([Text.Encoding]::ASCII.GetString($privatePemBytes))
+            $wrappedPayloadKey = [Convert]::FromBase64String((Get-Content -LiteralPath (Join-Path $run8 'payload-v2.key.enc.b64') -Raw).Trim())
+            $payloadKey = $bootstrapRsa.Decrypt($wrappedPayloadKey, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          } finally {
+            $bootstrapRsa.Dispose()
+          }
+          if ($payloadKey.Length -ne 32) { throw 'Run 8 payload key length invalid' }
+
+          $researcherRsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $researcherPem = Get-Content -LiteralPath (Join-Path $current 'bootstrap/researcher-export-public.pem') -Raw
+            $researcherRsa.ImportFromPem($researcherPem)
+            $sealedKey = $researcherRsa.Encrypt($payloadKey, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          } finally {
+            $researcherRsa.Dispose()
+          }
+
+          $out = Join-Path $PWD 'sealed-run8-key-export'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          [Convert]::ToBase64String($sealedKey) | Set-Content -LiteralPath (Join-Path $out 'run8-payload-key.rsa-oaep-sha256.b64') -Encoding ascii
+          [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($sealedKey)).ToLowerInvariant() | Set-Content -LiteralPath (Join-Path $out 'sealed-key.sha256') -Encoding ascii
+          @(
+            'FORMAT=RSA-OAEP-SHA256',
+            'PLAINTEXT_LENGTH=32',
+            'SOURCE_RUN_ID=43627561055',
+            'SOURCE_SHA=a15fae9662e0f05b82f80e29c0418fa5c675e572',
+            'SOURCE_PAYLOAD_KEY_SHA= a41568cf1735dbbfc82fdda46e16cd9201d4cd58',
+            'EXPORT_RUN_ID=${{ github.run_id }}'
+          ) | Set-Content -LiteralPath (Join-Path $out 'metadata.txt') -Encoding ascii
+
+          [Array]::Clear($payloadKey, 0, $payloadKey.Length)
+          [Array]::Clear($privatePemBytes, 0, $privatePemBytes.Length)
+          [Array]::Clear($wrappingKey, 0, $wrappingKey.Length)
+          Write-Host 'RUN8_SEALED_KEY_EXPORT=PASS'
+
+      - name: Upload Run 8 sealed payload key
+        uses: actions/upload-artifact@v4
+        with:
+          name: sealed-run8-payload-key-for-researcher
+          path: sealed-run8-key-export
+          if-no-files-found: error
+          retention-days: 1
