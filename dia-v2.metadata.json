@@ -1,0 +1,21 @@
+{
+  "changes": [
+    "net48 DateTime compatibility",
+    "Ecma335 MetadataTokens namespace",
+    "hard fail native command exit codes",
+    "required output and manifest preconditions"
+  ],
+  "created_utc": "2026-11-14T23:16:40.692892+00:00",
+  "format": "ZDB-AES-256-CBC-PKCS7-RSA-OAEP-SHA256-V1",
+  "payload_version": "dia-v2",
+  "plaintext_files": {
+    "DiaHarness/DiaHarness.csproj": "4673c46a8bdb812ca3ee7502324968d3df46f3cdc29f5e07e6ad33f953c736ea",
+    "DiaHarness/Program.cs": "51bf81e1154234eb2c9a382b8ad7a0ab3b0702e6fe11d204d42f14df7383f3ab",
+    "README.txt": "29f75fe488d19a063c0de491a304b42835d85639cdd31adb66898301c41b0628",
+    "Seed/Seed.cs": "d0b17c49abd03fe60425c82848cfcd6af3362c5692bc3e9847501d617ef319b4",
+    "Seed/Seed.csproj": "594a02bdccc5ece113c6b1809a21920460e6ff120b4c0fd0421389b8cae5be70",
+    "mutate_pdb.py": "f6d8c33c97fc4536f81b0a9445457009c08b21c3c5b972a0877a77965005ee1e",
+    "run.ps1": "5b025434345d0aff5846b78bd8bd85bc57f65a638b0d50f9ff958c1b67834caa"
+  },
+  "plaintext_zip_sha256": "d5eff05b4473d9322c0fddc2973c8f4aec0d42bb4d2b42ce91f3d22380fc31b6"
+}
