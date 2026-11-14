@@ -1,0 +1,46 @@
+name: Bootstrap Wrapped Validation Key
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Generate one-time wrapped RSA key
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [ -z "${WRAPPING_KEY_B64:-}" ]; then
+            echo "WRAPPING_KEY_MISSING"
+            exit 1
+          fi
+          printf '%s' "$WRAPPING_KEY_B64" | base64 -d > wrapping.key
+          if [ "$(wc -c < wrapping.key)" -ne 32 ]; then
+            echo "WRAPPING_KEY_INVALID_LENGTH"
+            exit 1
+          fi
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out private.pem >/dev/null 2>&1
+          openssl pkey -in private.pem -pubout -out public.pem >/dev/null 2>&1
+          iv_hex="$(openssl rand -hex 16)"
+          key_hex="$(xxd -p -c 256 wrapping.key)"
+          openssl enc -aes-256-cbc -K "$key_hex" -iv "$iv_hex" -in private.pem -out private.pem.enc
+          public_b64="$(base64 -w0 public.pem)"
+          private_enc_b64="$(base64 -w0 private.pem.enc)"
+          public_sha256="$(sha256sum public.pem | awk '{print $1}')"
+          private_enc_sha256="$(sha256sum private.pem.enc | awk '{print $1}')"
+          echo "BOOTSTRAP_VERSION=1"
+          echo "BOOTSTRAP_PUBLIC_B64=$public_b64"
+          echo "BOOTSTRAP_PUBLIC_SHA256=$public_sha256"
+          echo "BOOTSTRAP_PRIVATE_ENC_B64=$private_enc_b64"
+          echo "BOOTSTRAP_PRIVATE_IV_HEX=$iv_hex"
+          echo "BOOTSTRAP_PRIVATE_ENC_SHA256=$private_enc_sha256"
+          echo "BOOTSTRAP_RESULT=PASS"
+          rm -f wrapping.key private.pem public.pem private.pem.enc
