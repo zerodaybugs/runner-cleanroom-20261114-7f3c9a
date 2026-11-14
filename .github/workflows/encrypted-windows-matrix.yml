@@ -91,7 +91,7 @@ jobs:
           & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $payloadPath
           if ($LASTEXITCODE -ne 0) { throw "payload failed: $LASTEXITCODE" }
 
-      - name: Encrypt evidence and emit sealed receipt
+      - name: Seal native evidence
         if: always()
         shell: pwsh
         run: |
@@ -129,17 +129,31 @@ jobs:
             $aes.Dispose()
           }
 
-          $cipherHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($cipher)).ToLowerInvariant()
-          $ivHex = [Convert]::ToHexString($evidenceIv).ToLowerInvariant()
-          $cipherB64 = [Convert]::ToBase64String($cipher)
-          Write-Host 'EVIDENCE_BUNDLE_BEGIN'
-          Write-Host "EVIDENCE_SDK=${{ matrix.sdk }}"
-          Write-Host "EVIDENCE_REPEAT=${{ matrix.repeat }}"
-          Write-Host "EVIDENCE_PLAIN_SHA256=$plainHash"
-          Write-Host "EVIDENCE_CIPHER_SHA256=$cipherHash"
-          Write-Host "EVIDENCE_IV_HEX=$ivHex"
-          Write-Host "EVIDENCE_CIPHER_B64=$cipherB64"
-          Write-Host 'EVIDENCE_BUNDLE_END'
+          $sealed = Join-Path $PWD 'sealed-evidence'
+          New-Item -ItemType Directory -Force -Path $sealed | Out-Null
+          $cipherPath = Join-Path $sealed 'evidence.enc'
+          [IO.File]::WriteAllBytes($cipherPath, $cipher)
+          [Convert]::ToHexString($evidenceIv).ToLowerInvariant() | Set-Content (Join-Path $sealed 'evidence.iv.hex') -Encoding ascii
+          $plainHash | Set-Content (Join-Path $sealed 'evidence.plain.sha256') -Encoding ascii
+          (Get-FileHash -Algorithm SHA256 -LiteralPath $cipherPath).Hash.ToLowerInvariant() | Set-Content (Join-Path $sealed 'evidence.cipher.sha256') -Encoding ascii
+          @(
+            'FORMAT=ZDB-AES-256-CBC-PKCS7-V1',
+            'SDK=${{ matrix.sdk }}',
+            'REPEAT=${{ matrix.repeat }}',
+            'RUN_ID=${{ github.run_id }}',
+            'JOB=${{ github.job }}',
+            'SOURCE_SHA=${{ github.sha }}'
+          ) | Set-Content (Join-Path $sealed 'metadata.txt') -Encoding ascii
 
+          Write-Host "SEALED_EVIDENCE=PASS SDK=${{ matrix.sdk }} REPEAT=${{ matrix.repeat }}"
           Remove-Item -LiteralPath $zipPath,$keyPath,(Join-Path $PWD 'payload.ps1') -Force -ErrorAction SilentlyContinue
           foreach ($dir in $dirs) { Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+
+      - name: Upload sealed native evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: winhttp-native-${{ matrix.sdk }}-r${{ matrix.repeat }}
+          path: sealed-evidence
+          if-no-files-found: error
+          retention-days: 3
