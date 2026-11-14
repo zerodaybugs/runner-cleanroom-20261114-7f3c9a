@@ -1,0 +1,148 @@
+name: Encrypted Native Windows TLS Matrix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ['10.0.404', '11.0.100']
+        repeat: [1, 2, 3]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Unwrap and execute private TLS validation payload
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          SDK_VERSION: ${{ matrix.sdk }}
+          REPEAT_ID: ${{ matrix.repeat }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WRAPPING_KEY_B64)) { throw 'wrapping key missing' }
+
+          $wrappingKey = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
+          if ($wrappingKey.Length -ne 32) { throw 'wrapping key length invalid' }
+          $wrappedPrivate = [IO.File]::ReadAllBytes((Join-Path $PWD 'bootstrap/private.pem.enc'))
+          $wrapIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'bootstrap/private.iv.hex') -Raw).Trim())
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $wrappingKey
+            $aes.IV = $wrapIv
+            $decryptor = $aes.CreateDecryptor()
+            try { $privatePemBytes = $decryptor.TransformFinalBlock($wrappedPrivate, 0, $wrappedPrivate.Length) }
+            finally { $decryptor.Dispose() }
+          } finally { $aes.Dispose() }
+
+          $rsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $rsa.ImportFromPem([Text.Encoding]::ASCII.GetString($privatePemBytes))
+            $wrappedPayloadKey = [Convert]::FromBase64String((Get-Content -LiteralPath (Join-Path $PWD 'payload-v2.key.enc.b64') -Raw).Trim())
+            $payloadKey = $rsa.Decrypt($wrappedPayloadKey, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          } finally { $rsa.Dispose() }
+          if ($payloadKey.Length -ne 32) { throw 'payload key length invalid' }
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'payload-v3.runtime.key'), $payloadKey)
+
+          $partFiles = @(Get-ChildItem -LiteralPath (Join-Path $PWD 'payload-v3.parts') -File -Filter 'payload-v3.part-*' | Sort-Object Name)
+          if ($partFiles.Count -ne 7) { throw "unexpected payload part count: $($partFiles.Count)" }
+          $payloadB64 = [string]::Concat(@($partFiles | ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw).Trim() }))
+          $payloadCipher = [Convert]::FromBase64String($payloadB64)
+          $cipherHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($payloadCipher)).ToLowerInvariant()
+          if ($cipherHash -ne '1fd89e2d0cf21fbf202bb2c7228699b41f07c2532b1230edb0969d24542b9ae7') { throw "payload cipher hash mismatch: $cipherHash" }
+          $payloadIv = [Convert]::FromHexString('e2f6a0a3aedb8c492e15201eec58f85e')
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $payloadIv
+            $decryptor = $aes.CreateDecryptor()
+            try { $payloadPlain = $decryptor.TransformFinalBlock($payloadCipher, 0, $payloadCipher.Length) }
+            finally { $decryptor.Dispose() }
+          } finally { $aes.Dispose() }
+
+          $payloadPath = Join-Path $PWD 'payload-v3.ps1'
+          [IO.File]::WriteAllBytes($payloadPath, $payloadPlain)
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadPath).Hash.ToLowerInvariant()
+          if ($actualHash -ne 'dd75c8c57e46df9100b517a5b9dd8a6dc7515b21c1627c4462ec08be33452eca') { throw "payload hash mismatch: $actualHash" }
+
+          & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $payloadPath
+          if ($LASTEXITCODE -ne 0) { throw "payload failed: $LASTEXITCODE" }
+
+      - name: Seal native TLS evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $keyPath = Join-Path $PWD 'payload-v3.runtime.key'
+          $dirs = @(Get-ChildItem -LiteralPath $PWD -Directory -Filter 'evidence-*')
+          if ($dirs.Count -eq 0) {
+            $fallback = Join-Path $PWD 'evidence-fallback'
+            New-Item -ItemType Directory -Force -Path $fallback | Out-Null
+            'NO_EVIDENCE_DIRECTORY' | Set-Content (Join-Path $fallback 'status.txt')
+            $dirs = @((Get-Item -LiteralPath $fallback))
+          }
+          if (-not (Test-Path -LiteralPath $keyPath)) { throw 'payload evidence key unavailable' }
+
+          $zipPath = Join-Path $PWD 'evidence.plain.zip'
+          Compress-Archive -Path $dirs.FullName -DestinationPath $zipPath -Force
+          $plainHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
+          $payloadKey = [IO.File]::ReadAllBytes($keyPath)
+          $evidenceIv = [Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $plain = [IO.File]::ReadAllBytes($zipPath)
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $evidenceIv
+            $encryptor = $aes.CreateEncryptor()
+            try { $cipher = $encryptor.TransformFinalBlock($plain, 0, $plain.Length) }
+            finally { $encryptor.Dispose() }
+          } finally { $aes.Dispose() }
+
+          $sealed = Join-Path $PWD 'sealed-evidence'
+          New-Item -ItemType Directory -Force -Path $sealed | Out-Null
+          $cipherPath = Join-Path $sealed 'evidence.enc'
+          [IO.File]::WriteAllBytes($cipherPath, $cipher)
+          [Convert]::ToHexString($evidenceIv).ToLowerInvariant() | Set-Content (Join-Path $sealed 'evidence.iv.hex') -Encoding ascii
+          $plainHash | Set-Content (Join-Path $sealed 'evidence.plain.sha256') -Encoding ascii
+          (Get-FileHash -Algorithm SHA256 -LiteralPath $cipherPath).Hash.ToLowerInvariant() | Set-Content (Join-Path $sealed 'evidence.cipher.sha256') -Encoding ascii
+          @(
+            'FORMAT=ZDB-AES-256-CBC-PKCS7-V1',
+            'TRANSPORT=TLS_TWO_DISTINCT_PINNED_CERTIFICATES',
+            'SDK=${{ matrix.sdk }}',
+            'REPEAT=${{ matrix.repeat }}',
+            'RUN_ID=${{ github.run_id }}',
+            'JOB=${{ github.job }}',
+            'SOURCE_SHA=${{ github.sha }}'
+          ) | Set-Content (Join-Path $sealed 'metadata.txt') -Encoding ascii
+
+          Write-Host "SEALED_TLS_EVIDENCE=PASS SDK=${{ matrix.sdk }} REPEAT=${{ matrix.repeat }}"
+          Remove-Item -LiteralPath $zipPath,$keyPath,(Join-Path $PWD 'payload-v3.ps1') -Force -ErrorAction SilentlyContinue
+          foreach ($dir in $dirs) { Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+
+      - name: Upload sealed native TLS evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: winhttp-native-tls-${{ matrix.sdk }}-r${{ matrix.repeat }}
+          path: sealed-evidence
+          if-no-files-found: error
+          retention-days: 3
