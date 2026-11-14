@@ -12,6 +12,7 @@ jobs:
       fail-fast: false
       matrix:
         sdk: ['10.0.404', '11.0.100']
+        repeat: [1, 2, 3]
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -26,6 +27,7 @@ jobs:
         env:
           PAYLOAD_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
           SDK_VERSION: ${{ matrix.sdk }}
+          REPEAT_ID: ${{ matrix.repeat }}
         run: |
           $ErrorActionPreference = 'Stop'
           if ([string]::IsNullOrWhiteSpace($env:PAYLOAD_KEY_B64)) { throw 'payload key missing' }
@@ -49,7 +51,7 @@ jobs:
           }
           [IO.File]::WriteAllBytes((Join-Path $PWD 'payload.ps1'), $plain)
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PWD 'payload.ps1')).Hash.ToLowerInvariant()
-          if ($hash -ne 'e2127ac276edc7aaa07fd0ae8948f3327a7dfe09efdb5bee1ea21cc11c98e166') { throw "payload hash mismatch: $hash" }
+          if ($hash -ne '56ee9d8f649e89a8ede94bc9fc71a4079453072c19b114406a1e6ab05172d481') { throw "payload hash mismatch: $hash" }
           & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PWD 'payload.ps1')
           if ($LASTEXITCODE -ne 0) { throw "payload failed: $LASTEXITCODE" }
 
@@ -103,7 +105,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sdk-msi-junction-encrypted-${{ matrix.sdk }}
+          name: sdk-msi-junction-encrypted-${{ matrix.sdk }}-r${{ matrix.repeat }}
           path: |
             evidence.enc
             evidence.iv.b64
