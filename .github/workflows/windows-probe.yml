@@ -1,0 +1,27 @@
+name: Windows Runner Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Record runner
+        shell: pwsh
+        run: |
+          $out = Join-Path $PWD 'probe'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          @(
+            "RUNNER_OS=$env:RUNNER_OS"
+            "OS=$([Environment]::OSVersion)"
+            "WHOAMI=$(& whoami.exe)"
+          ) | Set-Content (Join-Path $out 'probe.txt')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-probe
+          path: probe
