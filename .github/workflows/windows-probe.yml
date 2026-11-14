@@ -22,6 +22,10 @@ jobs:
           $listenerA = $null
           $listenerB = $null
 
+          function Matches-ProbeAddress($row) {
+            return (($row.IPAddress -split '%')[0] -eq $address)
+          }
+
           function Write-Snapshot([string]$label) {
             Write-Host "===== $label / adapters ====="
             Get-NetAdapter -IncludeHidden | Sort-Object ifIndex | Format-Table -AutoSize | Out-String -Width 260 | Write-Host
@@ -36,44 +40,35 @@ jobs:
             Write-Host "ADMIN=$(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
             Write-Snapshot 'BEFORE'
 
-            $interfaces = @(Get-NetIPInterface -AddressFamily IPv6 | Sort-Object InterfaceIndex)
-            $loop = $interfaces | Where-Object { $_.InterfaceAlias -match 'Loopback' } | Select-Object -First 1
-            $nonLoop = $interfaces |
+            $selected = @(Get-NetIPInterface -AddressFamily IPv6 |
               Where-Object {
-                $_.InterfaceIndex -ne $loop.InterfaceIndex -and
                 $_.ConnectionState -eq 'Connected' -and
                 $_.InterfaceAlias -notmatch 'Loopback|isatap|Teredo'
               } |
-              Select-Object -First 1
-            if (-not $loop) { throw 'No IPv6 loopback interface found' }
-            if (-not $nonLoop) { throw 'No connected non-loopback IPv6 interface found' }
+              Sort-Object InterfaceIndex |
+              Select-Object -First 2)
+            if ($selected.Count -lt 2) { throw "Need two connected non-loopback IPv6 interfaces; found $($selected.Count)" }
 
-            $ifA = [int]$loop.InterfaceIndex
-            $ifB = [int]$nonLoop.InterfaceIndex
-            Write-Host "SELECTED_IF_A=$ifA ALIAS=$($loop.InterfaceAlias)"
-            Write-Host "SELECTED_IF_B=$ifB ALIAS=$($nonLoop.InterfaceAlias)"
+            $ifA = [int]$selected[0].InterfaceIndex
+            $ifB = [int]$selected[1].InterfaceIndex
+            Write-Host "SELECTED_IF_A=$ifA ALIAS=$($selected[0].InterfaceAlias)"
+            Write-Host "SELECTED_IF_B=$ifB ALIAS=$($selected[1].InterfaceAlias)"
 
             foreach ($idx in @($ifA,$ifB)) {
               Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv6 -DadTransmits 0 -RouterDiscovery Disabled -ErrorAction SilentlyContinue
               Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv6 -ErrorAction SilentlyContinue |
-                Where-Object IPAddress -eq $address |
+                Where-Object { Matches-ProbeAddress $_ } |
                 Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-              try {
-                New-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv6 -IPAddress $address -PrefixLength 64 -SkipAsSource $false -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-              }
-              catch {
-                Write-Host "NEW_NET_IP_FAILED_IF_${idx}=$($_.Exception.Message)"
-                & netsh.exe interface ipv6 add address interface=$idx address=$address type=unicast store=active skipassource=false
-                if ($LASTEXITCODE -ne 0) { throw "Unable to assign $address to interface $idx" }
-              }
+              $created = New-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv6 -IPAddress $address -PrefixLength 64 -SkipAsSource $false -PolicyStore ActiveStore -ErrorAction Stop
+              Write-Host "CREATE_IF_${idx}=$($created.IPAddress) STATE=$($created.AddressState)"
               $added += $idx
             }
 
             Start-Sleep -Seconds 2
-            $aRows = @(Get-NetIPAddress -InterfaceIndex $ifA -AddressFamily IPv6 | Where-Object IPAddress -eq $address)
-            $bRows = @(Get-NetIPAddress -InterfaceIndex $ifB -AddressFamily IPv6 | Where-Object IPAddress -eq $address)
-            Write-Host "ASSIGNMENT_A_COUNT=$($aRows.Count)"
-            Write-Host "ASSIGNMENT_B_COUNT=$($bRows.Count)"
+            $aRows = @(Get-NetIPAddress -InterfaceIndex $ifA -AddressFamily IPv6 | Where-Object { Matches-ProbeAddress $_ })
+            $bRows = @(Get-NetIPAddress -InterfaceIndex $ifB -AddressFamily IPv6 | Where-Object { Matches-ProbeAddress $_ })
+            Write-Host "ASSIGNMENT_A_COUNT=$($aRows.Count) VALUE=$($aRows.IPAddress -join ',')"
+            Write-Host "ASSIGNMENT_B_COUNT=$($bRows.Count) VALUE=$($bRows.IPAddress -join ',')"
             if ($aRows.Count -ne 1 -or $bRows.Count -ne 1) { throw 'Duplicate link-local assignment verification failed' }
 
             $ipA = [Net.IPAddress]::Parse("${address}%${ifA}")
@@ -124,7 +119,7 @@ jobs:
             if ($listenerB) { $listenerB.Stop() }
             foreach ($idx in $added) {
               Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv6 -ErrorAction SilentlyContinue |
-                Where-Object IPAddress -eq $address |
+                Where-Object { Matches-ProbeAddress $_ } |
                 Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
             }
           }
