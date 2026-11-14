@@ -1,0 +1,67 @@
+name: Encrypted Windows Matrix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ['10.0.404', '11.0.100']
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Decrypt and execute private validation payload
+        shell: pwsh
+        env:
+          PAYLOAD_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          SDK_VERSION: ${{ matrix.sdk }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:PAYLOAD_KEY_B64)) { throw 'payload key missing' }
+          $key = [Convert]::FromBase64String($env:PAYLOAD_KEY_B64)
+          $iv = [Convert]::FromBase64String((Get-Content -LiteralPath payload.iv.b64 -Raw).Trim())
+          $cipherText = [Convert]::FromBase64String((Get-Content -LiteralPath payload.enc.b64 -Raw).Trim())
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $key
+            $aes.IV = $iv
+            $decryptor = $aes.CreateDecryptor()
+            try {
+              $plain = $decryptor.TransformFinalBlock($cipherText, 0, $cipherText.Length)
+            } finally {
+              $decryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'payload.ps1'), $plain)
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PWD 'payload.ps1')).Hash.ToLowerInvariant()
+          if ($hash -ne 'd28e1d492b37a4cc93c487fc99cdac0ad6b1fd2172526e952804df04aa473387') { throw "payload hash mismatch: $hash" }
+          & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PWD 'payload.ps1')
+          if ($LASTEXITCODE -ne 0) { throw "payload failed: $LASTEXITCODE" }
+
+      - name: Remove decrypted payload
+        if: always()
+        shell: pwsh
+        run: Remove-Item -LiteralPath (Join-Path $PWD 'payload.ps1') -Force -ErrorAction SilentlyContinue
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-msi-junction-${{ matrix.sdk }}
+          path: evidence-*
+          if-no-files-found: warn
