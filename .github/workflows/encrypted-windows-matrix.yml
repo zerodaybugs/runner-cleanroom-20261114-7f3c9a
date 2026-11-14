@@ -22,51 +22,81 @@ jobs:
         with:
           dotnet-version: ${{ matrix.sdk }}
 
-      - name: Decrypt and execute private validation payload
+      - name: Unwrap and execute private validation payload
         shell: pwsh
         env:
-          PAYLOAD_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
           SDK_VERSION: ${{ matrix.sdk }}
           REPEAT_ID: ${{ matrix.repeat }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ([string]::IsNullOrWhiteSpace($env:PAYLOAD_KEY_B64)) { throw 'payload key missing' }
-          $key = [Convert]::FromBase64String($env:PAYLOAD_KEY_B64)
-          $iv = [Convert]::FromBase64String((Get-Content -LiteralPath payload.iv.b64 -Raw).Trim())
-          $cipherText = [Convert]::FromBase64String((Get-Content -LiteralPath payload.enc.b64 -Raw).Trim())
+          if ([string]::IsNullOrWhiteSpace($env:WRAPPING_KEY_B64)) { throw 'wrapping key missing' }
+
+          $wrappingKey = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
+          if ($wrappingKey.Length -ne 32) { throw 'wrapping key length invalid' }
+          $wrappedPrivate = [IO.File]::ReadAllBytes((Join-Path $PWD 'bootstrap/private.pem.enc'))
+          $wrapIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'bootstrap/private.iv.hex') -Raw).Trim())
+
           $aes = [Security.Cryptography.Aes]::Create()
           try {
             $aes.Mode = [Security.Cryptography.CipherMode]::CBC
             $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
-            $aes.Key = $key
-            $aes.IV = $iv
+            $aes.Key = $wrappingKey
+            $aes.IV = $wrapIv
             $decryptor = $aes.CreateDecryptor()
             try {
-              $plain = $decryptor.TransformFinalBlock($cipherText, 0, $cipherText.Length)
+              $privatePemBytes = $decryptor.TransformFinalBlock($wrappedPrivate, 0, $wrappedPrivate.Length)
             } finally {
               $decryptor.Dispose()
             }
           } finally {
             $aes.Dispose()
           }
-          [IO.File]::WriteAllBytes((Join-Path $PWD 'payload.ps1'), $plain)
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PWD 'payload.ps1')).Hash.ToLowerInvariant()
-          if ($hash -ne '89cee3063c100c0c4598545e1588f6ff1fcc1f34d2515b74f1b0ca78dae9ddb9') { throw "payload hash mismatch: $hash" }
-          & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PWD 'payload.ps1')
+
+          $rsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $rsa.ImportFromPem([Text.Encoding]::ASCII.GetString($privatePemBytes))
+            $wrappedPayloadKey = [Convert]::FromBase64String((Get-Content -LiteralPath (Join-Path $PWD 'payload-v2.key.enc.b64') -Raw).Trim())
+            $payloadKey = $rsa.Decrypt($wrappedPayloadKey, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          } finally {
+            $rsa.Dispose()
+          }
+          if ($payloadKey.Length -ne 32) { throw 'payload key length invalid' }
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'payload-v2.runtime.key'), $payloadKey)
+
+          $payloadIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'payload-v2.iv.hex') -Raw).Trim())
+          $payloadCipher = [Convert]::FromBase64String((Get-Content -LiteralPath (Join-Path $PWD 'payload-v2.enc.b64') -Raw).Trim())
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $payloadIv
+            $decryptor = $aes.CreateDecryptor()
+            try {
+              $payloadPlain = $decryptor.TransformFinalBlock($payloadCipher, 0, $payloadCipher.Length)
+            } finally {
+              $decryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+
+          $payloadPath = Join-Path $PWD 'payload.ps1'
+          [IO.File]::WriteAllBytes($payloadPath, $payloadPlain)
+          $expectedHash = (Get-Content -LiteralPath (Join-Path $PWD 'payload-v2.plain.sha256') -Raw).Trim().ToLowerInvariant()
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadPath).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) { throw "payload hash mismatch: $actualHash" }
+
+          & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $payloadPath
           if ($LASTEXITCODE -ne 0) { throw "payload failed: $LASTEXITCODE" }
 
-      - name: Remove decrypted payload
+      - name: Encrypt evidence and emit sealed receipt
         if: always()
         shell: pwsh
-        run: Remove-Item -LiteralPath (Join-Path $PWD 'payload.ps1') -Force -ErrorAction SilentlyContinue
-
-      - name: Encrypt evidence before artifact upload
-        if: always()
-        shell: pwsh
-        env:
-          PAYLOAD_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $keyPath = Join-Path $PWD 'payload-v2.runtime.key'
           $dirs = @(Get-ChildItem -LiteralPath $PWD -Directory -Filter 'evidence-*')
           if ($dirs.Count -eq 0) {
             $fallback = Join-Path $PWD 'evidence-fallback'
@@ -74,18 +104,21 @@ jobs:
             'NO_EVIDENCE_DIRECTORY' | Set-Content (Join-Path $fallback 'status.txt')
             $dirs = @((Get-Item -LiteralPath $fallback))
           }
+          if (-not (Test-Path -LiteralPath $keyPath)) { throw 'payload evidence key unavailable' }
+
           $zipPath = Join-Path $PWD 'evidence.plain.zip'
           Compress-Archive -Path $dirs.FullName -DestinationPath $zipPath -Force
-          (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant() | Set-Content (Join-Path $PWD 'evidence.plain.sha256')
-          $key = [Convert]::FromBase64String($env:PAYLOAD_KEY_B64)
-          $iv = [Convert]::FromBase64String((Get-Content -LiteralPath payload.iv.b64 -Raw).Trim())
+          $plainHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
+          $payloadKey = [IO.File]::ReadAllBytes($keyPath)
+          $evidenceIv = [Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
           $plain = [IO.File]::ReadAllBytes($zipPath)
+
           $aes = [Security.Cryptography.Aes]::Create()
           try {
             $aes.Mode = [Security.Cryptography.CipherMode]::CBC
             $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
-            $aes.Key = $key
-            $aes.IV = $iv
+            $aes.Key = $payloadKey
+            $aes.IV = $evidenceIv
             $encryptor = $aes.CreateEncryptor()
             try {
               $cipher = $encryptor.TransformFinalBlock($plain, 0, $plain.Length)
@@ -95,18 +128,18 @@ jobs:
           } finally {
             $aes.Dispose()
           }
-          [IO.File]::WriteAllBytes((Join-Path $PWD 'evidence.enc'), $cipher)
-          (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PWD 'evidence.enc')).Hash.ToLowerInvariant() | Set-Content (Join-Path $PWD 'evidence.cipher.sha256')
-          Remove-Item -LiteralPath $zipPath -Force
-          foreach ($dir in $dirs) { Remove-Item -LiteralPath $dir.FullName -Recurse -Force }
 
-      - name: Upload encrypted evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: winhttp-scope-native-encrypted-${{ matrix.sdk }}-r${{ matrix.repeat }}
-          path: |
-            evidence.enc
-            evidence.plain.sha256
-            evidence.cipher.sha256
-          if-no-files-found: error
+          $cipherHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($cipher)).ToLowerInvariant()
+          $ivHex = [Convert]::ToHexString($evidenceIv).ToLowerInvariant()
+          $cipherB64 = [Convert]::ToBase64String($cipher)
+          Write-Host 'EVIDENCE_BUNDLE_BEGIN'
+          Write-Host "EVIDENCE_SDK=${{ matrix.sdk }}"
+          Write-Host "EVIDENCE_REPEAT=${{ matrix.repeat }}"
+          Write-Host "EVIDENCE_PLAIN_SHA256=$plainHash"
+          Write-Host "EVIDENCE_CIPHER_SHA256=$cipherHash"
+          Write-Host "EVIDENCE_IV_HEX=$ivHex"
+          Write-Host "EVIDENCE_CIPHER_B64=$cipherB64"
+          Write-Host 'EVIDENCE_BUNDLE_END'
+
+          Remove-Item -LiteralPath $zipPath,$keyPath,(Join-Path $PWD 'payload.ps1') -Force -ErrorAction SilentlyContinue
+          foreach ($dir in $dirs) { Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue }
