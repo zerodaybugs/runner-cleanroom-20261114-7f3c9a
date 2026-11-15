@@ -1,21 +1,21 @@
 {
-  "changes": [
-    "net48 DateTime compatibility",
-    "Ecma335 MetadataTokens namespace",
-    "hard fail native command exit codes",
-    "required output and manifest preconditions"
-  ],
-  "created_utc": "2026-11-14T23:16:40.692892+00:00",
+  "created_utc": "2026-11-15T10:41:46.780Z",
   "format": "ZDB-AES-256-CBC-PKCS7-RSA-OAEP-SHA256-V1",
-  "payload_version": "dia-v2",
+  "payload_version": "dia-v3-reviewed-current-ga",
+  "source_workflow": "zerodaybugs/test@7c3f4747a76d286819ae32afc877e10778a584f6:.github/workflows/diasym-portable-final-corpus-20261111.yml",
+  "current_matrix": [
+    "10.0.15-r1",
+    "10.0.15-r2",
+    "11.0.0-r1",
+    "11.0.0-r2"
+  ],
+  "dump_policy": "Rerun up to the first three suspicious cases with DOTNET_DbgEnableMiniDump=1 and full dump type 4.",
   "plaintext_files": {
-    "DiaHarness/DiaHarness.csproj": "4673c46a8bdb812ca3ee7502324968d3df46f3cdc29f5e07e6ad33f953c736ea",
-    "DiaHarness/Program.cs": "51bf81e1154234eb2c9a382b8ad7a0ab3b0702e6fe11d204d42f14df7383f3ab",
-    "README.txt": "29f75fe488d19a063c0de491a304b42835d85639cdd31adb66898301c41b0628",
-    "Seed/Seed.cs": "d0b17c49abd03fe60425c82848cfcd6af3362c5692bc3e9847501d617ef319b4",
-    "Seed/Seed.csproj": "594a02bdccc5ece113c6b1809a21920460e6ff120b4c0fd0421389b8cae5be70",
-    "mutate_pdb.py": "f6d8c33c97fc4536f81b0a9445457009c08b21c3c5b972a0877a77965005ee1e",
-    "run.ps1": "5b025434345d0aff5846b78bd8bd85bc57f65a638b0d50f9ff958c1b67834caa"
+    "Program.cs": "a15c8febb57900f1654aad4bdc299075975d059c5de5041a65dca6c3a8aba03a",
+    "DiaSymPortableProbe.csproj": "2a7ededb461c9bef6ad0dbdfd8edb601e42b9d161cf7046f91b957e2cc5773a6",
+    "run.ps1": "702b3ccaf721c88f3569463893915a8cc295f2439321056ad35cec85b238d9f0"
   },
-  "plaintext_zip_sha256": "d5eff05b4473d9322c0fddc2973c8f4aec0d42bb4d2b42ce91f3d22380fc31b6"
+  "plaintext_zip_sha256": "fe25b19e47470062e813b6578426f8b1a80e42acc78441ec1f278b581cef3f28",
+  "ciphertext_sha256": "0fdd6d7ac9261cea16c39cf5fce9252f45b939b2a9dc85e0d3df5ee0756dc380",
+  "wrapped_key_sha256": "8dc48dfffccc2cab00be2434b840ea5a53947435d05fb6de06f363fd1c0b73c6"
 }
