@@ -54,7 +54,8 @@ jobs:
                   }
                   try
                   {
-                      return Local(DecimalNegative + DecimalLarge + DecimalZero) + (int)dynamicValue + tuple.left + (decimal)DoubleValue + LongValue;
+                      decimal numericGuards = (DoubleValue > 0 ? 1m : 0m) + (LongValue == long.MinValue ? 1m : 0m);
+                      return Local(DecimalNegative + DecimalLarge + DecimalZero) + (int)dynamicValue + tuple.left + numericGuards;
                   }
                   catch (Exception ex) when (ex.Message.Length >= 0)
                   {
