@@ -2,6 +2,11 @@ name: Export Sealed Payload Key
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - bootstrap/export-trigger.txt
 
 permissions:
   contents: read
