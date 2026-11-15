@@ -1,0 +1,174 @@
+name: Encrypted DiaSymReader Binary Diff Inputs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: '1'
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_MULTILEVEL_LOOKUP: '0'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+
+jobs:
+  collect:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Collect vulnerable and fixed native binaries and seal evidence
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ([string]::IsNullOrWhiteSpace($env:WRAPPING_KEY_B64)) { throw 'wrapping key missing' }
+
+          $repo = $PWD.Path
+          $out = Join-Path $repo 'diasym-binary-diff-inputs'
+          $sealed = Join-Path $repo 'sealed-evidence'
+          Remove-Item -LiteralPath $out,$sealed -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          $installer = Join-Path $env:RUNNER_TEMP 'dotnet-install.ps1'
+          Invoke-WebRequest 'https://dot.net/v1/dotnet-install.ps1' -OutFile $installer
+
+          $matrix = @(
+            [pscustomobject]@{ Label='vulnerable-10.0.14'; Sdk='10.0.114'; Runtime='10.0.14' },
+            [pscustomobject]@{ Label='fixed-10.0.15'; Sdk='10.0.404'; Runtime='10.0.15' }
+          )
+          $records = @()
+          foreach ($entry in $matrix) {
+            $installRoot = Join-Path $env:RUNNER_TEMP ("dotnet-{0}" -f $entry.Runtime)
+            & $installer -Version $entry.Sdk -InstallDir $installRoot -Architecture x64 -NoPath 2>&1 |
+              Tee-Object -FilePath (Join-Path $out ("install-{0}.log" -f $entry.Runtime))
+            $dotnet = Join-Path $installRoot 'dotnet.exe'
+            if (-not (Test-Path -LiteralPath $dotnet)) { throw "dotnet missing for $($entry.Runtime)" }
+            $actualSdk = (& $dotnet --version).Trim()
+            $runtimeList = @(& $dotnet --list-runtimes)
+            if ($actualSdk -ne $entry.Sdk) { throw "SDK mismatch for $($entry.Runtime): $actualSdk" }
+            if (-not ($runtimeList -match "^Microsoft.NETCore.App $([regex]::Escape($entry.Runtime)) \[")) {
+              throw "runtime missing: $($entry.Runtime)"
+            }
+
+            $dll = Join-Path $installRoot ("shared\Microsoft.NETCore.App\{0}\Microsoft.DiaSymReader.Native.amd64.dll" -f $entry.Runtime)
+            if (-not (Test-Path -LiteralPath $dll)) { throw "native DLL missing: $dll" }
+            $dst = Join-Path $out ("Microsoft.DiaSymReader.Native.amd64.{0}.dll" -f $entry.Runtime)
+            Copy-Item -LiteralPath $dll -Destination $dst -Force
+            $sig = Get-AuthenticodeSignature -LiteralPath $dst
+            $vi = (Get-Item -LiteralPath $dst).VersionInfo
+            $records += [pscustomobject]@{
+              label = $entry.Label
+              sdk = $entry.Sdk
+              runtime = $entry.Runtime
+              file = [IO.Path]::GetFileName($dst)
+              bytes = (Get-Item -LiteralPath $dst).Length
+              sha256 = (Get-FileHash -LiteralPath $dst -Algorithm SHA256).Hash.ToLowerInvariant()
+              file_version = $vi.FileVersion
+              product_version = $vi.ProductVersion
+              original_filename = $vi.OriginalFilename
+              signature_status = [string]$sig.Status
+              signer_subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { $null }
+              signer_thumbprint = if ($sig.SignerCertificate) { $sig.SignerCertificate.Thumbprint } else { $null }
+            }
+          }
+          $records | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $out 'binary-metadata.json') -Encoding utf8NoBOM
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path -LiteralPath $vswhere) {
+            $vcTools = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            if ($vcTools) {
+              $dumpbin = Get-ChildItem -LiteralPath (Join-Path $vcTools 'VC\Tools\MSVC') -Recurse -Filter dumpbin.exe -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match '\\bin\\Hostx64\\x64\\dumpbin.exe$' } |
+                Sort-Object FullName -Descending |
+                Select-Object -First 1
+              if ($dumpbin) {
+                $dumpbin.FullName | Set-Content -LiteralPath (Join-Path $out 'dumpbin-path.txt') -Encoding utf8NoBOM
+                foreach ($record in $records) {
+                  $filePath = Join-Path $out $record.file
+                  & $dumpbin.FullName /headers /loadconfig /exports /pdata /unwindinfo $filePath 2>&1 |
+                    Set-Content -LiteralPath (Join-Path $out ("{0}.dumpbin.txt" -f $record.file)) -Encoding utf8NoBOM
+                }
+              }
+            }
+          }
+
+          $manifest = @(
+            Get-ChildItem -LiteralPath $out -Recurse -File |
+              Sort-Object FullName |
+              ForEach-Object {
+                [pscustomobject]@{
+                  path = $_.FullName.Substring($out.Length + 1).Replace('\','/')
+                  bytes = $_.Length
+                  sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                }
+              }
+          )
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $out 'manifest.preseal.json') -Encoding utf8NoBOM
+
+          $wrappingKey = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
+          if ($wrappingKey.Length -ne 32) { throw 'wrapping key length invalid' }
+          $wrappedPrivate = [IO.File]::ReadAllBytes((Join-Path $repo 'bootstrap/private.pem.enc'))
+          $wrapIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $repo 'bootstrap/private.iv.hex') -Raw).Trim())
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $wrappingKey
+            $aes.IV = $wrapIv
+            $dec = $aes.CreateDecryptor()
+            try { $privatePemBytes = $dec.TransformFinalBlock($wrappedPrivate, 0, $wrappedPrivate.Length) }
+            finally { $dec.Dispose() }
+          } finally { $aes.Dispose() }
+          $rsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $rsa.ImportFromPem([Text.Encoding]::ASCII.GetString($privatePemBytes))
+            $wrappedPayloadKey = [Convert]::FromBase64String((Get-Content -LiteralPath (Join-Path $repo 'dia-v2.key.enc.b64') -Raw).Trim())
+            $payloadKey = $rsa.Decrypt($wrappedPayloadKey, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          } finally { $rsa.Dispose() }
+          if ($payloadKey.Length -ne 32) { throw 'payload key length invalid' }
+
+          $plainZip = Join-Path $env:RUNNER_TEMP 'diasym-binary-diff-inputs.zip'
+          Compress-Archive -Path (Join-Path $out '*') -DestinationPath $plainZip -CompressionLevel Optimal -Force
+          $plain = [IO.File]::ReadAllBytes($plainZip)
+          $iv = [Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $iv
+            $enc = $aes.CreateEncryptor()
+            try { $cipher = $enc.TransformFinalBlock($plain, 0, $plain.Length) }
+            finally { $enc.Dispose() }
+          } finally { $aes.Dispose() }
+
+          New-Item -ItemType Directory -Force -Path $sealed | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $sealed 'evidence.enc'), $cipher)
+          [Convert]::ToHexString($iv).ToLowerInvariant() | Set-Content -LiteralPath (Join-Path $sealed 'evidence.iv.hex') -Encoding ascii
+          [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($cipher)).ToLowerInvariant() | Set-Content -LiteralPath (Join-Path $sealed 'evidence.cipher.sha256') -Encoding ascii
+          [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($plain)).ToLowerInvariant() | Set-Content -LiteralPath (Join-Path $sealed 'evidence.plain.sha256') -Encoding ascii
+          @(
+            'PURPOSE=DiaSymReader vulnerable-versus-fixed binary diff inputs',
+            'VULNERABLE_RUNTIME=10.0.14',
+            'FIXED_RUNTIME=10.0.15',
+            "SOURCE_SHA=${{ github.sha }}"
+          ) | Set-Content -LiteralPath (Join-Path $sealed 'metadata.txt') -Encoding ascii
+
+          [Array]::Clear($payloadKey,0,$payloadKey.Length)
+          [Array]::Clear($privatePemBytes,0,$privatePemBytes.Length)
+          [Array]::Clear($wrappingKey,0,$wrappingKey.Length)
+          Write-Host 'DIASYM_BINARY_DIFF_INPUT_COLLECTION=PASS'
+
+      - name: Upload sealed binary diff inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: diasymreader-binary-diff-inputs-10.0.14-vs-10.0.15
+          path: sealed-evidence
+          if-no-files-found: error
+          retention-days: 3
