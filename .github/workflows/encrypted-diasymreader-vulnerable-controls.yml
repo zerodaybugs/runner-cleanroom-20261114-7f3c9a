@@ -1,0 +1,164 @@
+name: Encrypted DiaSymReader Known-Vulnerable Controls
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: '1'
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_MULTILEVEL_LOOKUP: '0'
+
+jobs:
+  validate-control:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk: 10.0.114
+            tfm: net10.0
+            runtime: 10.0.14
+            repeat: control-10
+          - sdk: 11.0.100-rc.3.26522.148
+            tfm: net11.0
+            runtime: 11.0.0-rc.3.26522.148
+            repeat: control-11
+    runs-on: windows-2025
+    timeout-minutes: 35
+    env:
+      SDK_VERSION: ${{ matrix.sdk }}
+      TARGET_TFM: ${{ matrix.tfm }}
+      RUNTIME_VERSION: ${{ matrix.runtime }}
+      REPEAT_ID: ${{ matrix.repeat }}
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install exact isolated SDK and execute encrypted payload
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WRAPPING_KEY_B64)) { throw 'wrapping key missing' }
+
+          $installRoot = Join-Path $env:RUNNER_TEMP 'dotnet-exact'
+          $installer = Join-Path $env:RUNNER_TEMP 'dotnet-install.ps1'
+          Invoke-WebRequest 'https://dot.net/v1/dotnet-install.ps1' -OutFile $installer
+          & $installer -Version $env:SDK_VERSION -InstallDir $installRoot -Architecture x64 -NoPath
+          if ($LASTEXITCODE -ne 0) { throw "dotnet-install failed: $LASTEXITCODE" }
+          $env:DOTNET_ROOT = $installRoot
+          $env:PATH = "$installRoot;$env:PATH"
+          $actualSdk = (& dotnet --version).Trim()
+          if ($actualSdk -ne $env:SDK_VERSION) { throw "SDK mismatch: expected $env:SDK_VERSION actual $actualSdk" }
+          $runtimeList = @(& dotnet --list-runtimes)
+          if (-not ($runtimeList -match "^Microsoft.NETCore.App $([regex]::Escape($env:RUNTIME_VERSION)) \[")) { throw "runtime mismatch: expected $env:RUNTIME_VERSION" }
+
+          $wrappingKey = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
+          if ($wrappingKey.Length -ne 32) { throw 'wrapping key length invalid' }
+          $wrappedPrivate = [IO.File]::ReadAllBytes((Join-Path $PWD 'bootstrap/private.pem.enc'))
+          $wrapIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'bootstrap/private.iv.hex') -Raw).Trim())
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $wrappingKey
+            $aes.IV = $wrapIv
+            $dec = $aes.CreateDecryptor()
+            try { $privatePemBytes = $dec.TransformFinalBlock($wrappedPrivate, 0, $wrappedPrivate.Length) }
+            finally { $dec.Dispose() }
+          } finally { $aes.Dispose() }
+          $rsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $rsa.ImportFromPem([Text.Encoding]::ASCII.GetString($privatePemBytes))
+            $wrappedPayloadKey = [Convert]::FromBase64String((Get-Content -LiteralPath (Join-Path $PWD 'dia-v2.key.enc.b64') -Raw).Trim())
+            $payloadKey = $rsa.Decrypt($wrappedPayloadKey, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          } finally { $rsa.Dispose() }
+          if ($payloadKey.Length -ne 32) { throw 'payload key length invalid' }
+
+          $cipherB64 = (Get-ChildItem -LiteralPath $PWD -Filter 'dia-v2.enc.part*' -File | Sort-Object Name | ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw).Trim() }) -join ''
+          $cipher = [Convert]::FromBase64String($cipherB64)
+          $iv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'dia-v2.iv.hex') -Raw).Trim())
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $iv
+            $dec = $aes.CreateDecryptor()
+            try { $plain = $dec.TransformFinalBlock($cipher, 0, $cipher.Length) }
+            finally { $dec.Dispose() }
+          } finally { $aes.Dispose() }
+          $actualPlain = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($plain)).ToLowerInvariant()
+          $expectedPlain = (Get-Content -LiteralPath (Join-Path $PWD 'dia-v2.plain.sha256') -Raw).Trim().ToLowerInvariant()
+          if ($actualPlain -ne $expectedPlain) { throw "payload hash mismatch: $actualPlain != $expectedPlain" }
+          $zipPath = Join-Path $env:RUNNER_TEMP 'dia-v3-control.zip'
+          [IO.File]::WriteAllBytes($zipPath, $plain)
+          $payloadDir = Join-Path $env:RUNNER_TEMP 'dia-v3-control'
+          Remove-Item -LiteralPath $payloadDir -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $payloadDir -Force
+          & (Join-Path $payloadDir 'run.ps1')
+          if ($LASTEXITCODE -ne 0) { throw "payload failed: $LASTEXITCODE" }
+          [Array]::Clear($payloadKey, 0, $payloadKey.Length)
+          [Array]::Clear($privatePemBytes, 0, $privatePemBytes.Length)
+          [Array]::Clear($wrappingKey, 0, $wrappingKey.Length)
+
+      - name: Seal control evidence
+        if: always()
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Get-ChildItem -LiteralPath $PWD -Directory | Where-Object { $_.Name -like 'evidence-diasymreader-*' } | Select-Object -First 1
+          if (-not $evidence) { throw 'evidence directory missing' }
+          $files = @(Get-ChildItem -LiteralPath $evidence.FullName -Recurse -File)
+          if ($files.Count -eq 0) { throw 'evidence directory empty' }
+          $manifest = foreach ($file in $files) {
+            [pscustomobject]@{
+              path = $file.FullName.Substring($evidence.FullName.Length + 1).Replace('\','/')
+              bytes = $file.Length
+              sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+          $manifest | Sort-Object path | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $evidence.FullName 'manifest.sealed.json') -Encoding utf8NoBOM
+          $plainZip = Join-Path $env:RUNNER_TEMP 'evidence-control.zip'
+          Compress-Archive -Path (Join-Path $evidence.FullName '*') -DestinationPath $plainZip -CompressionLevel Optimal -Force
+          $plain = [IO.File]::ReadAllBytes($plainZip)
+          $key = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
+          $iv = [Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $key
+            $aes.IV = $iv
+            $enc = $aes.CreateEncryptor()
+            try { $cipher = $enc.TransformFinalBlock($plain, 0, $plain.Length) }
+            finally { $enc.Dispose() }
+          } finally { $aes.Dispose() }
+          $out = Join-Path $PWD 'sealed-evidence'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $out 'evidence.enc'), $cipher)
+          [Convert]::ToHexString($iv).ToLowerInvariant() | Set-Content -LiteralPath (Join-Path $out 'evidence.iv.hex') -Encoding ascii
+          [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($cipher)).ToLowerInvariant() | Set-Content -LiteralPath (Join-Path $out 'evidence.cipher.sha256') -Encoding ascii
+          [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($plain)).ToLowerInvariant() | Set-Content -LiteralPath (Join-Path $out 'evidence.plain.sha256') -Encoding ascii
+          @(
+            "SDK_VERSION=$env:SDK_VERSION",
+            "TARGET_TFM=$env:TARGET_TFM",
+            "RUNTIME_VERSION=$env:RUNTIME_VERSION",
+            "REPEAT_ID=$env:REPEAT_ID",
+            "SOURCE_SHA=${{ github.sha }}"
+          ) | Set-Content -LiteralPath (Join-Path $out 'metadata.txt') -Encoding ascii
+          [Array]::Clear($key, 0, $key.Length)
+
+      - name: Upload sealed control evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diasymreader-native-control-${{ matrix.runtime }}
+          path: sealed-evidence
+          if-no-files-found: error
+          retention-days: 3
