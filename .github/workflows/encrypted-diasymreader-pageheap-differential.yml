@@ -1,0 +1,400 @@
+name: Encrypted DiaSymReader PageHeap Differential
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: '1'
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_MULTILEVEL_LOOKUP: '0'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+
+jobs:
+  pageheap-differential:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: vulnerable-10.0.14
+            sdk: 10.0.114
+            tfm: net10.0
+            runtime: 10.0.14
+            classification: vulnerable-control
+          - label: fixed-10.0.15
+            sdk: 10.0.404
+            tfm: net10.0
+            runtime: 10.0.15
+            classification: current-fixed
+          - label: vulnerable-11.0.0-rc3
+            sdk: 11.0.100-rc.3.26522.148
+            tfm: net11.0
+            runtime: 11.0.0-rc.3.26522.148
+            classification: vulnerable-control
+          - label: fixed-11.0.0
+            sdk: 11.0.100
+            tfm: net11.0
+            runtime: 11.0.0
+            classification: current-fixed
+
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      SDK_VERSION: ${{ matrix.sdk }}
+      TARGET_TFM: ${{ matrix.tfm }}
+      RUNTIME_VERSION: ${{ matrix.runtime }}
+      BUILD_CLASSIFICATION: ${{ matrix.classification }}
+      MATRIX_LABEL: ${{ matrix.label }}
+
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Run encrypted PageHeap differential and seal evidence
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ([string]::IsNullOrWhiteSpace($env:WRAPPING_KEY_B64)) { throw 'wrapping key missing' }
+
+          $repo = $PWD.Path
+          $safeRuntime = $env:RUNTIME_VERSION -replace '[^0-9A-Za-z._-]','_'
+          $evidence = Join-Path $repo ("pageheap-evidence-{0}" -f $safeRuntime)
+          $sealed = Join-Path $repo 'sealed-evidence'
+          Remove-Item -LiteralPath $evidence,$sealed -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $evidence 'dumps') | Out-Null
+
+          $installRoot = Join-Path $env:RUNNER_TEMP ("dotnet-exact-{0}" -f $safeRuntime)
+          $installer = Join-Path $env:RUNNER_TEMP 'dotnet-install.ps1'
+          Invoke-WebRequest 'https://dot.net/v1/dotnet-install.ps1' -OutFile $installer
+          & $installer -Version $env:SDK_VERSION -InstallDir $installRoot -Architecture x64 -NoPath 2>&1 |
+            Tee-Object -FilePath (Join-Path $evidence 'dotnet-install.log')
+          if (-not (Test-Path -LiteralPath (Join-Path $installRoot 'dotnet.exe'))) {
+            throw 'isolated dotnet installation missing'
+          }
+
+          $env:DOTNET_ROOT = $installRoot
+          $env:DOTNET_ROOT_X64 = $installRoot
+          $env:PATH = "$installRoot;$env:PATH"
+          $actualSdk = (& (Join-Path $installRoot 'dotnet.exe') --version).Trim()
+          if ($actualSdk -ne $env:SDK_VERSION) {
+            throw "SDK mismatch: expected $env:SDK_VERSION actual $actualSdk"
+          }
+          $runtimeList = @(& (Join-Path $installRoot 'dotnet.exe') --list-runtimes)
+          if (-not ($runtimeList -match "^Microsoft.NETCore.App $([regex]::Escape($env:RUNTIME_VERSION)) \[")) {
+            throw "runtime mismatch: expected $env:RUNTIME_VERSION"
+          }
+          & (Join-Path $installRoot 'dotnet.exe') --info | Set-Content -LiteralPath (Join-Path $evidence 'dotnet-info.txt') -Encoding utf8NoBOM
+          $runtimeList | Set-Content -LiteralPath (Join-Path $evidence 'dotnet-runtimes.txt') -Encoding utf8NoBOM
+
+          # Recover the encrypted payload key without exporting either secret.
+          $wrappingKey = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
+          if ($wrappingKey.Length -ne 32) { throw 'wrapping key length invalid' }
+          $wrappedPrivate = [IO.File]::ReadAllBytes((Join-Path $repo 'bootstrap/private.pem.enc'))
+          $wrapIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $repo 'bootstrap/private.iv.hex') -Raw).Trim())
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $wrappingKey
+            $aes.IV = $wrapIv
+            $decryptor = $aes.CreateDecryptor()
+            try {
+              $privatePemBytes = $decryptor.TransformFinalBlock($wrappedPrivate, 0, $wrappedPrivate.Length)
+            } finally {
+              $decryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+
+          $rsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $rsa.ImportFromPem([Text.Encoding]::ASCII.GetString($privatePemBytes))
+            $wrappedPayloadKey = [Convert]::FromBase64String(
+              (Get-Content -LiteralPath (Join-Path $repo 'dia-v2.key.enc.b64') -Raw).Trim()
+            )
+            $payloadKey = $rsa.Decrypt(
+              $wrappedPayloadKey,
+              [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256
+            )
+          } finally {
+            $rsa.Dispose()
+          }
+          if ($payloadKey.Length -ne 32) { throw 'payload key length invalid' }
+
+          $cipherB64 = (
+            Get-ChildItem -LiteralPath $repo -Filter 'dia-v2.enc.part*' -File |
+              Sort-Object Name |
+              ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw).Trim() }
+          ) -join ''
+          $payloadCipher = [Convert]::FromBase64String($cipherB64)
+          $payloadIv = [Convert]::FromHexString(
+            (Get-Content -LiteralPath (Join-Path $repo 'dia-v2.iv.hex') -Raw).Trim()
+          )
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $payloadIv
+            $decryptor = $aes.CreateDecryptor()
+            try {
+              $payloadPlain = $decryptor.TransformFinalBlock($payloadCipher, 0, $payloadCipher.Length)
+            } finally {
+              $decryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+          $actualPayloadHash = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($payloadPlain)
+          ).ToLowerInvariant()
+          $expectedPayloadHash = (
+            Get-Content -LiteralPath (Join-Path $repo 'dia-v2.plain.sha256') -Raw
+          ).Trim().ToLowerInvariant()
+          if ($actualPayloadHash -ne $expectedPayloadHash) {
+            throw "payload hash mismatch: $actualPayloadHash != $expectedPayloadHash"
+          }
+
+          $payloadZip = Join-Path $env:RUNNER_TEMP 'dia-pageheap-payload.zip'
+          $payloadDir = Join-Path $env:RUNNER_TEMP 'dia-pageheap-payload'
+          [IO.File]::WriteAllBytes($payloadZip, $payloadPlain)
+          Remove-Item -LiteralPath $payloadDir -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $payloadZip -DestinationPath $payloadDir -Force
+
+          # Generate the exact corpus and build the apphost before enabling PageHeap.
+          $env:REPEAT_ID = "pageheap-$($env:MATRIX_LABEL)"
+          & (Join-Path $payloadDir 'run.ps1') *> (Join-Path $evidence 'baseline-corpus-run.log')
+          if (-not $?) { throw 'baseline corpus generation failed' }
+
+          $work = Join-Path $env:RUNNER_TEMP ("diasym-v3-{0}-r{1}" -f $safeRuntime,$env:REPEAT_ID)
+          $corpus = Join-Path $work 'corpus'
+          $apphost = Join-Path $work ("bin\Release\{0}\DiaSymPortableProbe.exe" -f $env:TARGET_TFM)
+          if (-not (Test-Path -LiteralPath $corpus)) { throw "corpus missing: $corpus" }
+          if (-not (Test-Path -LiteralPath $apphost)) { throw "apphost missing: $apphost" }
+
+          $baselineEvidence = Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Directory |
+            Where-Object { $_.Name -like "evidence-diasymreader-$safeRuntime-*" } |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+          if ($baselineEvidence) {
+            Copy-Item -LiteralPath $baselineEvidence.FullName -Destination (Join-Path $evidence 'baseline') -Recurse -Force
+          }
+
+          $gflagsCandidates = @(
+            (Get-Command gflags.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
+            (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\gflags.exe" -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+          ) | Where-Object { $_ } | Select-Object -Unique
+          $gflags = $gflagsCandidates | Select-Object -First 1
+          if (-not $gflags) { throw 'gflags.exe not found on runner' }
+          $gflags | Set-Content -LiteralPath (Join-Path $evidence 'gflags-path.txt') -Encoding utf8NoBOM
+
+          $dumpFolder = Join-Path $evidence 'dumps'
+          $localDumpsKey = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\DiaSymPortableProbe.exe'
+          New-Item -Path $localDumpsKey -Force | Out-Null
+          New-ItemProperty -Path $localDumpsKey -Name DumpFolder -PropertyType ExpandString -Value $dumpFolder -Force | Out-Null
+          New-ItemProperty -Path $localDumpsKey -Name DumpType -PropertyType DWord -Value 2 -Force | Out-Null
+          New-ItemProperty -Path $localDumpsKey -Name DumpCount -PropertyType DWord -Value 20 -Force | Out-Null
+
+          $pageHeapEnableLog = Join-Path $evidence 'gflags-enable.log'
+          & $gflags /p /enable DiaSymPortableProbe.exe /full 2>&1 | Tee-Object -FilePath $pageHeapEnableLog
+          if ($LASTEXITCODE -ne 0) { throw "gflags enable failed: $LASTEXITCODE" }
+          & $gflags /p 2>&1 | Set-Content -LiteralPath (Join-Path $evidence 'gflags-query.log') -Encoding utf8NoBOM
+
+          $selectedCases = @(
+            'control_valid_embedded.pdb',
+            'embedded_parent_doc1.pdb',
+            'embedded_parent_doc0.pdb',
+            'docname_valid_len_128.pdb',
+            'docname_valid_len_1048576.pdb'
+          )
+          $results = @()
+          $testStart = (Get-Date).ToUniversalTime()
+
+          try {
+            foreach ($caseName in $selectedCases) {
+              $casePath = Join-Path $corpus $caseName
+              if (-not (Test-Path -LiteralPath $casePath)) {
+                throw "selected case missing: $caseName"
+              }
+
+              $caseStem = [IO.Path]::GetFileNameWithoutExtension($caseName)
+              $stdoutPath = Join-Path $evidence ("pageheap-{0}.stdout.txt" -f $caseStem)
+              $stderrPath = Join-Path $evidence ("pageheap-{0}.stderr.txt" -f $caseStem)
+              $dumpsBefore = @(
+                Get-ChildItem -LiteralPath $dumpFolder -File -ErrorAction SilentlyContinue |
+                  Select-Object -ExpandProperty Name
+              )
+
+              $psi = [Diagnostics.ProcessStartInfo]::new()
+              $psi.FileName = $apphost
+              $psi.ArgumentList.Add('probe')
+              $psi.ArgumentList.Add($casePath)
+              $psi.WorkingDirectory = $work
+              $psi.UseShellExecute = $false
+              $psi.RedirectStandardOutput = $true
+              $psi.RedirectStandardError = $true
+              $psi.CreateNoWindow = $true
+              $psi.Environment['DOTNET_ROOT'] = $installRoot
+              $psi.Environment['DOTNET_ROOT_X64'] = $installRoot
+              $psi.Environment['DOTNET_MULTILEVEL_LOOKUP'] = '0'
+              $psi.Environment['DOTNET_CLI_TELEMETRY_OPTOUT'] = '1'
+
+              $process = [Diagnostics.Process]::new()
+              $process.StartInfo = $psi
+              $started = (Get-Date).ToUniversalTime()
+              [void]$process.Start()
+              $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+              $stderrTask = $process.StandardError.ReadToEndAsync()
+              $finished = $process.WaitForExit(30000)
+              $timedOut = -not $finished
+              if ($timedOut) {
+                try { $process.Kill($true) } catch {}
+                [void]$process.WaitForExit(5000)
+              }
+              $stdout = $stdoutTask.GetAwaiter().GetResult()
+              $stderr = $stderrTask.GetAwaiter().GetResult()
+              $exitCode = if ($timedOut) { $null } else { $process.ExitCode }
+              $ended = (Get-Date).ToUniversalTime()
+              $stdout | Set-Content -LiteralPath $stdoutPath -Encoding utf8NoBOM
+              $stderr | Set-Content -LiteralPath $stderrPath -Encoding utf8NoBOM
+              Start-Sleep -Seconds 2
+
+              $dumpsAfter = @(
+                Get-ChildItem -LiteralPath $dumpFolder -File -ErrorAction SilentlyContinue |
+                  Select-Object -ExpandProperty Name
+              )
+              $newDumps = @($dumpsAfter | Where-Object { $_ -notin $dumpsBefore })
+              $results += [pscustomobject]@{
+                case = $caseName
+                sha256 = (Get-FileHash -LiteralPath $casePath -Algorithm SHA256).Hash.ToLowerInvariant()
+                exit_code = $exitCode
+                exit_hex = if ($null -eq $exitCode) { $null } else { ('0x{0:X8}' -f ([int64]$exitCode -band 0xffffffffL)) }
+                timeout = $timedOut
+                duration_ms = [int64]($ended - $started).TotalMilliseconds
+                stdout_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($stdout))).ToLowerInvariant()
+                stderr_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($stderr))).ToLowerInvariant()
+                new_dumps = $newDumps
+              }
+              $process.Dispose()
+            }
+          } finally {
+            & $gflags /p /disable DiaSymPortableProbe.exe 2>&1 |
+              Set-Content -LiteralPath (Join-Path $evidence 'gflags-disable.log') -Encoding utf8NoBOM
+            Remove-Item -Path $localDumpsKey -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          $results | ConvertTo-Json -Depth 8 |
+            Set-Content -LiteralPath (Join-Path $evidence 'pageheap-results.json') -Encoding utf8NoBOM
+
+          try {
+            Get-WinEvent -FilterHashtable @{ LogName='Application'; StartTime=$testStart.ToLocalTime() } -ErrorAction Stop |
+              Where-Object {
+                $_.Message -match 'DiaSymPortableProbe|Application Error|Windows Error Reporting|heap|verifier'
+              } |
+              Select-Object TimeCreated,Id,ProviderName,LevelDisplayName,Message |
+              ConvertTo-Json -Depth 5 |
+              Set-Content -LiteralPath (Join-Path $evidence 'application-events.json') -Encoding utf8NoBOM
+          } catch {
+            ($_ | Out-String) | Set-Content -LiteralPath (Join-Path $evidence 'application-events-error.txt') -Encoding utf8NoBOM
+          }
+
+          $nativeDll = Join-Path $installRoot ("shared\Microsoft.NETCore.App\{0}\Microsoft.DiaSymReader.Native.amd64.dll" -f $env:RUNTIME_VERSION)
+          $dumpFiles = @(Get-ChildItem -LiteralPath $dumpFolder -File -ErrorAction SilentlyContinue)
+          $suspicious = @(
+            $results | Where-Object {
+              $_.timeout -or
+              ($null -ne $_.exit_code -and $_.exit_code -notin @(0,10)) -or
+              @($_.new_dumps).Count -gt 0
+            }
+          )
+          [pscustomobject]@{
+            matrix_label = $env:MATRIX_LABEL
+            classification = $env:BUILD_CLASSIFICATION
+            sdk = $env:SDK_VERSION
+            tfm = $env:TARGET_TFM
+            runtime = $env:RUNTIME_VERSION
+            native_path = $nativeDll
+            native_sha256 = if (Test-Path -LiteralPath $nativeDll) {
+              (Get-FileHash -LiteralPath $nativeDll -Algorithm SHA256).Hash.ToLowerInvariant()
+            } else { $null }
+            gflags = $gflags
+            selected_case_count = $results.Count
+            suspicious_count = $suspicious.Count
+            dump_count = $dumpFiles.Count
+            suspicious_cases = @($suspicious | Select-Object -ExpandProperty case)
+            utc = (Get-Date).ToUniversalTime().ToString('o')
+          } | ConvertTo-Json -Depth 8 |
+            Set-Content -LiteralPath (Join-Path $evidence 'pageheap-summary.json') -Encoding utf8NoBOM
+
+          $manifest = @(
+            Get-ChildItem -LiteralPath $evidence -Recurse -File |
+              Sort-Object FullName |
+              ForEach-Object {
+                [pscustomobject]@{
+                  path = $_.FullName.Substring($evidence.Length + 1).Replace('\','/')
+                  bytes = $_.Length
+                  sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                }
+              }
+          )
+          $manifest | ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath (Join-Path $evidence 'manifest.preseal.json') -Encoding utf8NoBOM
+
+          $plainEvidenceZip = Join-Path $env:RUNNER_TEMP ("pageheap-evidence-{0}.zip" -f $safeRuntime)
+          Compress-Archive -Path (Join-Path $evidence '*') -DestinationPath $plainEvidenceZip -CompressionLevel Optimal -Force
+          $evidencePlain = [IO.File]::ReadAllBytes($plainEvidenceZip)
+          $evidenceIv = [Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $evidenceIv
+            $encryptor = $aes.CreateEncryptor()
+            try {
+              $evidenceCipher = $encryptor.TransformFinalBlock($evidencePlain, 0, $evidencePlain.Length)
+            } finally {
+              $encryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+
+          New-Item -ItemType Directory -Force -Path $sealed | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $sealed 'evidence.enc'), $evidenceCipher)
+          [Convert]::ToHexString($evidenceIv).ToLowerInvariant() |
+            Set-Content -LiteralPath (Join-Path $sealed 'evidence.iv.hex') -Encoding ascii
+          [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($evidenceCipher)).ToLowerInvariant() |
+            Set-Content -LiteralPath (Join-Path $sealed 'evidence.cipher.sha256') -Encoding ascii
+          [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($evidencePlain)).ToLowerInvariant() |
+            Set-Content -LiteralPath (Join-Path $sealed 'evidence.plain.sha256') -Encoding ascii
+          @(
+            "MATRIX_LABEL=$env:MATRIX_LABEL",
+            "BUILD_CLASSIFICATION=$env:BUILD_CLASSIFICATION",
+            "SDK_VERSION=$env:SDK_VERSION",
+            "TARGET_TFM=$env:TARGET_TFM",
+            "RUNTIME_VERSION=$env:RUNTIME_VERSION",
+            "PAYLOAD_SHA256=$actualPayloadHash",
+            "SOURCE_SHA=${{ github.sha }}"
+          ) | Set-Content -LiteralPath (Join-Path $sealed 'metadata.txt') -Encoding ascii
+
+          [Array]::Clear($payloadKey, 0, $payloadKey.Length)
+          [Array]::Clear($privatePemBytes, 0, $privatePemBytes.Length)
+          [Array]::Clear($wrappingKey, 0, $wrappingKey.Length)
+          Write-Host "PAGEHEAP_DIFFERENTIAL_COMPLETE=$($env:MATRIX_LABEL)"
+
+      - name: Upload sealed PageHeap evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diasymreader-pageheap-${{ matrix.label }}
+          path: sealed-evidence
+          if-no-files-found: error
+          retention-days: 3
