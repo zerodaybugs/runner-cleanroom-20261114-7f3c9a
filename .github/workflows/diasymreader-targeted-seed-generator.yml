@@ -1,0 +1,127 @@
+name: DiaSymReader Targeted Seed Generator
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk: '10.0.404'
+            tfm: 'net10.0'
+          - sdk: '11.0.100'
+            tfm: 'net11.0'
+    steps:
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Generate targeted portable and full PDB seeds
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force seedgen, evidence | Out-Null
+          @'
+          using System;
+          using System.Collections.Generic;
+          using System.Threading.Tasks;
+
+          internal static class Target
+          {
+              public static async Task<decimal> ConstantsAndAsync(int input)
+              {
+                  const decimal DecimalZero = 0m;
+                  const decimal DecimalSmall = 0.0000000000000000000000000001m;
+                  const decimal DecimalLarge = 79228162514264337593543950335m;
+                  const decimal DecimalNegative = -123456789.987654321m;
+                  const double DoubleValue = 1.7976931348623157E+308;
+                  const long LongValue = long.MinValue;
+                  const string TextValue = "PDB-SEED-DECIMAL-CONSTANT";
+                  dynamic dynamicValue = input;
+                  (int left, string right) tuple = (input, TextValue);
+                  await Task.Yield();
+                  decimal Local(decimal x)
+                  {
+                      const decimal NestedDecimal = 34028236692093846346337460743m;
+                      return x + NestedDecimal + DecimalSmall;
+                  }
+                  try
+                  {
+                      return Local(DecimalNegative + DecimalLarge + DecimalZero) + (int)dynamicValue + tuple.left + (decimal)DoubleValue + LongValue;
+                  }
+                  catch (Exception ex) when (ex.Message.Length >= 0)
+                  {
+                      return DecimalSmall;
+                  }
+              }
+
+              public static IEnumerable<int> Iterator(int count)
+              {
+                  const decimal IteratorDecimal = 42.125m;
+                  for (int i = 0; i < count; i++)
+                  {
+                      yield return i + (int)IteratorDecimal;
+                  }
+              }
+
+              public static int DenseSequencePoints(int x)
+              {
+                  int v = x;
+                  v += 1; v *= 2; v ^= 3; v -= 4; v += 5; v *= 6; v ^= 7; v -= 8;
+                  v += 9; v *= 10; v ^= 11; v -= 12; v += 13; v *= 14; v ^= 15; v -= 16;
+                  return v;
+              }
+
+              public static async Task Main()
+              {
+                  Console.WriteLine(await ConstantsAndAsync(3));
+                  foreach (var i in Iterator(3)) Console.WriteLine(i);
+                  Console.WriteLine(DenseSequencePoints(7));
+              }
+          }
+          '@ | Set-Content seedgen/Program.cs -Encoding utf8
+
+          foreach ($debugType in @('portable','full','pdbonly')) {
+            @"
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>${{ matrix.tfm }}</TargetFramework>
+              <DebugType>$debugType</DebugType>
+              <DebugSymbols>true</DebugSymbols>
+              <Optimize>false</Optimize>
+              <Deterministic>true</Deterministic>
+              <EmbedAllSources>true</EmbedAllSources>
+              <PathMap>D:\a\runner-cleanroom-20261114-7f3c9a\runner-cleanroom-20261114-7f3c9a\seedgen=/_/targeted_seed</PathMap>
+            </PropertyGroup>
+          </Project>
+          "@ | Set-Content seedgen/Target-$debugType.csproj -Encoding utf8
+            dotnet build seedgen/Target-$debugType.csproj -c Debug --nologo -o "out-$debugType" 2>&1 | Tee-Object "evidence/build-$debugType.log"
+            if ($LASTEXITCODE -ne 0) { throw "build failed: $debugType" }
+            $pdb = Get-ChildItem "out-$debugType" -Filter '*.pdb' | Select-Object -First 1
+            if (-not $pdb) { throw "PDB missing: $debugType" }
+            Copy-Item $pdb.FullName "evidence/Target-${{ matrix.tfm }}-$debugType.pdb"
+            Copy-Item (Get-ChildItem "out-$debugType" -Filter '*.dll' | Select-Object -First 1).FullName "evidence/Target-${{ matrix.tfm }}-$debugType.dll"
+            $bytes = [IO.File]::ReadAllBytes($pdb.FullName)
+            $head = [Text.Encoding]::ASCII.GetString($bytes,0,[Math]::Min(32,$bytes.Length))
+            [pscustomobject]@{ DebugType=$debugType; Length=$bytes.Length; HeadAscii=$head; HeadHex=[Convert]::ToHexString($bytes[0..([Math]::Min(31,$bytes.Length-1))]); Sha256=(Get-FileHash $pdb.FullName -Algorithm SHA256).Hash.ToLowerInvariant() } |
+              ConvertTo-Json | Set-Content "evidence/Target-${{ matrix.tfm }}-$debugType.json"
+          }
+
+          dotnet --info | Out-File evidence/dotnet-info.txt
+          Get-ChildItem evidence -File | Get-FileHash -Algorithm SHA256 | Sort-Object Path |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), $_.Path } | Set-Content evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diasymreader-targeted-seeds-${{ matrix.tfm }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 7
