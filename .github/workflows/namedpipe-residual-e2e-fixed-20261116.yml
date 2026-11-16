@@ -1,0 +1,90 @@
+name: Kestrel Named Pipe Lifecycle E2E Fixed 20261116
+
+on:
+  push:
+    branches:
+      - research/namedpipe-residual-20261116
+    paths:
+      - research/namedpipe-residual/**
+      - .github/workflows/namedpipe-residual-e2e-fixed-20261116.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-e2e:
+    name: Windows fixed E2E (${{ matrix.sdk }})
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk: 10.0.404
+            runtime: 10.0.15
+            tfm: net10.0
+            project: Probe.net10.csproj
+            executable: Probe.net10.exe
+          - sdk: 11.0.100
+            runtime: 11.0.0
+            tfm: net11.0
+            project: Probe.net11.csproj
+            executable: Probe.net11.exe
+
+    steps:
+      - name: Checkout candidate branch
+        uses: actions/checkout@v4
+
+      - name: Install exact SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Verify exact current GA and build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          $actualSdk = (& dotnet --version).Trim()
+          if ($actualSdk -ne '${{ matrix.sdk }}') { throw "SDK mismatch: $actualSdk" }
+          $runtimes = @(& dotnet --list-runtimes)
+          if (-not ($runtimes -match "^Microsoft.AspNetCore.App $([regex]::Escape('${{ matrix.runtime }}')) \[")) {
+            throw 'ASP.NET Core runtime mismatch'
+          }
+          dotnet --info | Set-Content -Encoding utf8 'evidence/dotnet-info-${{ matrix.sdk }}.txt'
+          dotnet --list-sdks | Set-Content -Encoding utf8 'evidence/dotnet-list-sdks-${{ matrix.sdk }}.txt'
+          dotnet --list-runtimes | Set-Content -Encoding utf8 'evidence/dotnet-list-runtimes-${{ matrix.sdk }}.txt'
+          dotnet build 'research/namedpipe-residual/${{ matrix.project }}' -c Release --nologo 2>&1 |
+            Tee-Object -FilePath 'evidence/build-${{ matrix.sdk }}.log'
+          if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+
+      - name: Execute fixed cross-principal lifecycle matrix
+        shell: pwsh
+        run: |
+          & 'research/namedpipe-residual/run-e2e-fixed.ps1' `
+            -Sdk '${{ matrix.sdk }}' `
+            -Tfm '${{ matrix.tfm }}' `
+            -Executable '${{ matrix.executable }}' `
+            -Repeats 3
+
+      - name: Hash evidence
+        if: always()
+        shell: pwsh
+        run: |
+          Get-ChildItem evidence -Recurse -File |
+            Sort-Object FullName |
+            ForEach-Object {
+              $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+              $relative = [IO.Path]::GetRelativePath((Join-Path $PWD 'evidence'), $_.FullName)
+              "$hash  $relative"
+            } | Set-Content -Encoding utf8 'evidence/SHA256SUMS-${{ matrix.sdk }}.txt'
+
+      - name: Upload exact-release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: namedpipe-lifecycle-fixed-${{ matrix.runtime }}-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 7
