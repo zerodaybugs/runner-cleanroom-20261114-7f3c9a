@@ -15,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         sdk: ['10.0.404', '11.0.100']
-    runs-on: macos-14
+    runs-on: macos-15-intel
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
