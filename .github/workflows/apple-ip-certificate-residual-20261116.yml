@@ -1,0 +1,66 @@
+name: apple-ip-certificate-residual-20261116
+
+on:
+  push:
+    branches:
+      - research/apple-ip-cert-residual-20261116
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.os }}-${{ matrix.tfm }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            sdk: 10.0.404
+            tfm: net10
+            project: Probe.net10.csproj
+          - os: macos-14
+            sdk: 11.0.100
+            tfm: net11
+            project: Probe.net11.csproj
+          - os: macos-15
+            sdk: 10.0.404
+            tfm: net10
+            project: Probe.net10.csproj
+          - os: macos-15
+            sdk: 11.0.100
+            tfm: net11
+            project: Probe.net11.csproj
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Run isolated certificate validation probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/results/${{ matrix.os }}-${{ matrix.tfm }}"
+          mkdir -p "$OUT"
+          dotnet --info > "$OUT/dotnet-info.txt"
+          dotnet --list-sdks > "$OUT/dotnet-list-sdks.txt"
+          dotnet --list-runtimes > "$OUT/dotnet-list-runtimes.txt"
+          sw_vers > "$OUT/sw-vers.txt"
+          uname -a > "$OUT/uname.txt"
+          cd "$GITHUB_WORKSPACE/research/apple-ip-cert-residual-20261116"
+          PROBE_OUTPUT="$OUT/probe.json" dotnet run -c Release --project "${{ matrix.project }}" | tee "$OUT/probe.stdout.txt"
+          shasum -a 256 "$OUT"/* > "$OUT/SHA256SUMS.txt"
+
+      - name: Upload receipts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-ip-cert-${{ matrix.os }}-${{ matrix.tfm }}
+          path: results/${{ matrix.os }}-${{ matrix.tfm }}/
+          if-no-files-found: error
+          retention-days: 7
