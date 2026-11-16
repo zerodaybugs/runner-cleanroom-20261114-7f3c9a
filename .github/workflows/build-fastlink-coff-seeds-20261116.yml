@@ -1,0 +1,56 @@
+name: Build FASTLINK COFF seeds
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86]
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+      - name: Build authentic COFF object and FASTLINK PDB
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'C:\diasym'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          @'
+          volatile int g_value = 7;
+          int add(int x) { return x + g_value; }
+          void mainCRTStartup(void) { volatile int y = add(3); (void)y; }
+          '@ | Set-Content -Encoding ascii "$root\seed.c"
+          & cl.exe /nologo /Zi /Od /c "/Fo:$root\seed.obj" "$root\seed.c" 2>&1 | Tee-Object "$root\cl.log"
+          if ($LASTEXITCODE -ne 0) { throw "cl failed: $LASTEXITCODE" }
+          & link.exe /nologo /debug:fastlink "/pdb:$root\seed.pdb" /entry:mainCRTStartup /subsystem:console /nodefaultlib "/out:$root\seed.exe" "$root\seed.obj" 2>&1 | Tee-Object "$root\link.log"
+          if ($LASTEXITCODE -ne 0) { throw "link failed: $LASTEXITCODE" }
+          & dumpbin.exe /headers /relocations "$root\seed.obj" | Out-File -Encoding utf8 "$root\dumpbin-object.txt"
+          & dumpbin.exe /headers "$root\seed.exe" | Out-File -Encoding utf8 "$root\dumpbin-image.txt"
+          $meta = [ordered]@{
+            schema = 'msrc-diasymreader-fastlink-seed-v1'
+            utc = (Get-Date).ToUniversalTime().ToString('o')
+            arch = '${{ matrix.arch }}'
+            cl = (& cl.exe 2>&1 | Select-Object -First 1 | Out-String).Trim()
+            link = (& link.exe /? 2>&1 | Select-Object -First 1 | Out-String).Trim()
+            files = Get-ChildItem $root -File | ForEach-Object {
+              [ordered]@{ name=$_.Name; bytes=$_.Length; sha256=(Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant() }
+            }
+          }
+          $meta | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 "$root\receipt.json"
+          Get-ChildItem $root -File | Select-Object Name,Length | Format-Table -AutoSize
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastlink-coff-${{ matrix.arch }}
+          path: C:\diasym\*
+          if-no-files-found: error
+          retention-days: 3
