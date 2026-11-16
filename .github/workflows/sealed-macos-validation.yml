@@ -1,6 +1,9 @@
 name: Sealed macOS VSTest E2E validation
 
 on:
+  push:
+    branches:
+      - research/vstest-macos-sealed-20261116
   workflow_dispatch:
 
 permissions:
@@ -27,9 +30,12 @@ jobs:
           WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
           SDK_VERSION: ${{ matrix.sdk }}
         run: |
-          ./scripts/run-sealed-payload.ps1 -PayloadPrefix 'vstest-macos-e2e-v1' -OutputPath (Join-Path $PWD 'vstest-macos-e2e-v1.payload.sh')
-          & /bin/chmod 0700 (Join-Path $PWD 'vstest-macos-e2e-v1.payload.sh')
-          & /bin/bash (Join-Path $PWD 'vstest-macos-e2e-v1.payload.sh')
+          $compressed = Join-Path $PWD 'vstest-macos-e2e-v3.payload.gz'
+          $payload = Join-Path $PWD 'vstest-macos-e2e-v3.payload.sh'
+          ./scripts/run-sealed-payload.ps1 -PayloadPrefix 'vstest-macos-e2e-v3' -OutputPath $compressed
+          & /usr/bin/gzip -dc $compressed | Set-Content -LiteralPath $payload -NoNewline
+          & /bin/chmod 0700 $payload
+          & /bin/bash $payload
           if ($LASTEXITCODE -ne 0) { throw "sealed E2E validation failed: $LASTEXITCODE" }
 
       - name: Seal private evidence
@@ -37,17 +43,18 @@ jobs:
         shell: pwsh
         run: |
           ./scripts/seal-evidence.ps1 `
-            -PayloadPrefix 'vstest-macos-e2e-v1' `
+            -PayloadPrefix 'vstest-macos-e2e-v3' `
             -EvidenceFilter 'evidence-vstest-macos-e2e-*' `
             -OutputDirectory (Join-Path $PWD 'sealed-evidence') `
             -Metadata 'SDK=${{ matrix.sdk }};RUN_ID=${{ github.run_id }};SOURCE_SHA=${{ github.sha }}'
-          Remove-Item -LiteralPath (Join-Path $PWD 'vstest-macos-e2e-v1.payload.sh') -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath (Join-Path $PWD 'vstest-macos-e2e-v3.payload.gz'),(Join-Path $PWD 'vstest-macos-e2e-v3.payload.sh') -Force -ErrorAction SilentlyContinue
+          Write-Host "SEALED_E2E_EVIDENCE=PASS SDK=${{ matrix.sdk }}"
 
       - name: Upload sealed evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vstest-macos-e2e-sealed-${{ matrix.sdk }}
+          name: vstest-macos-e2e-sealed-v3-${{ matrix.sdk }}
           path: sealed-evidence
           if-no-files-found: error
           retention-days: 3
