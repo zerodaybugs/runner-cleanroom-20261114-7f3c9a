@@ -1,0 +1,207 @@
+name: Encrypted WinHTTP IPv6 Scope E2E
+
+on:
+  push:
+    branches:
+      - winhttp-native-e2e-20261116
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Native Windows sealed matrix (${{ matrix.sdk }}, r${{ matrix.repeat }})
+    runs-on: windows-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        sdk: ['10.0.404', '11.0.100']
+        repeat: [1, 2, 3]
+
+    steps:
+      - name: Checkout cleanroom branch
+        uses: actions/checkout@v4
+
+      - name: Install exact SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Decrypt and execute private payload
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          SDK_VERSION: ${{ matrix.sdk }}
+          REPEAT_ID: ${{ matrix.repeat }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WRAPPING_KEY_B64)) { throw 'wrapping key missing' }
+
+          $wrappingKey = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
+          if ($wrappingKey.Length -ne 32) { throw 'wrapping key length invalid' }
+
+          $wrappedPrivate = [IO.File]::ReadAllBytes((Join-Path $PWD 'bootstrap/private.pem.enc'))
+          $wrapIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'bootstrap/private.iv.hex') -Raw).Trim())
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $wrappingKey
+            $aes.IV = $wrapIv
+            $decryptor = $aes.CreateDecryptor()
+            try {
+              $privatePemBytes = $decryptor.TransformFinalBlock($wrappedPrivate, 0, $wrappedPrivate.Length)
+            }
+            finally {
+              $decryptor.Dispose()
+            }
+          }
+          finally {
+            $aes.Dispose()
+          }
+
+          $rsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $rsa.ImportFromPem([Text.Encoding]::ASCII.GetString($privatePemBytes))
+            $wrappedPayloadKey = [Convert]::FromBase64String((Get-Content -LiteralPath (Join-Path $PWD 'winhttp-scope-v1.key.enc.b64') -Raw).Trim())
+            $payloadKey = $rsa.Decrypt($wrappedPayloadKey, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          }
+          finally {
+            $rsa.Dispose()
+            [Array]::Clear($privatePemBytes, 0, $privatePemBytes.Length)
+          }
+          if ($payloadKey.Length -ne 32) { throw 'payload key length invalid' }
+
+          $runtimeKeyPath = Join-Path $PWD 'winhttp-scope-v1.runtime.key'
+          [IO.File]::WriteAllBytes($runtimeKeyPath, $payloadKey)
+
+          $payloadIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'winhttp-scope-v1.iv.hex') -Raw).Trim())
+          $payloadCipherB64 = ((Get-ChildItem -LiteralPath $PWD -File -Filter 'winhttp-scope-v1.enc.b64.part*' | Sort-Object Name | ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw).Trim() }) -join '')
+          $payloadCipher = [Convert]::FromBase64String($payloadCipherB64)
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $payloadIv
+            $decryptor = $aes.CreateDecryptor()
+            try {
+              $payloadPlain = $decryptor.TransformFinalBlock($payloadCipher, 0, $payloadCipher.Length)
+            }
+            finally {
+              $decryptor.Dispose()
+            }
+          }
+          finally {
+            $aes.Dispose()
+          }
+
+          $payloadPath = Join-Path $PWD 'winhttp-scope-v1.payload.ps1'
+          [IO.File]::WriteAllBytes($payloadPath, $payloadPlain)
+          $expectedHash = (Get-Content -LiteralPath (Join-Path $PWD 'winhttp-scope-v1.plain.sha256') -Raw).Trim().ToLowerInvariant()
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadPath).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) { throw 'payload hash mismatch' }
+
+          $privateRunLog = Join-Path $PWD 'winhttp-private-run.log'
+          & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $payloadPath *> $privateRunLog
+          $payloadExit = $LASTEXITCODE
+
+          $evidenceDirs = @(Get-ChildItem -LiteralPath $PWD -Directory -Filter 'evidence-winhttp-*')
+          if ($evidenceDirs.Count -eq 0) {
+            $fallback = Join-Path $PWD ("evidence-winhttp-fallback-{0}-r{1}" -f $env:SDK_VERSION.Replace('.', '_'), $env:REPEAT_ID)
+            New-Item -ItemType Directory -Force -Path $fallback | Out-Null
+            'NO_PAYLOAD_EVIDENCE_DIRECTORY' | Set-Content -Encoding ascii (Join-Path $fallback 'status.txt')
+            $evidenceDirs = @((Get-Item -LiteralPath $fallback))
+          }
+          Copy-Item -LiteralPath $privateRunLog -Destination (Join-Path $evidenceDirs[0].FullName 'private-run.log') -Force
+          "PAYLOAD_EXIT_CODE=$payloadExit" | Set-Content -Encoding ascii (Join-Path $evidenceDirs[0].FullName 'wrapper-status.txt')
+
+          Remove-Item -LiteralPath $payloadPath,$privateRunLog -Force -ErrorAction SilentlyContinue
+          [Array]::Clear($payloadPlain, 0, $payloadPlain.Length)
+          [Array]::Clear($payloadKey, 0, $payloadKey.Length)
+
+          Write-Host "PRIVATE_PAYLOAD_EXECUTED sdk=${{ matrix.sdk }} repeat=${{ matrix.repeat }} exit=$payloadExit"
+          if ($payloadExit -ne 0) { throw "private payload failed with exit code $payloadExit" }
+
+      - name: Seal evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runtimeKeyPath = Join-Path $PWD 'winhttp-scope-v1.runtime.key'
+          $evidenceDirs = @(Get-ChildItem -LiteralPath $PWD -Directory -Filter 'evidence-winhttp-*')
+
+          if ($evidenceDirs.Count -eq 0) {
+            $fallback = Join-Path $PWD ("evidence-winhttp-fallback-${{ matrix.sdk }}-r${{ matrix.repeat }}")
+            New-Item -ItemType Directory -Force -Path $fallback | Out-Null
+            'NO_EVIDENCE_DIRECTORY' | Set-Content -Encoding ascii (Join-Path $fallback 'status.txt')
+            $evidenceDirs = @((Get-Item -LiteralPath $fallback))
+          }
+          if (-not (Test-Path -LiteralPath $runtimeKeyPath)) { throw 'runtime evidence key unavailable' }
+
+          $zipPath = Join-Path $PWD 'winhttp-evidence.plain.zip'
+          Compress-Archive -Path $evidenceDirs.FullName -DestinationPath $zipPath -Force
+          $plainHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
+          $payloadKey = [IO.File]::ReadAllBytes($runtimeKeyPath)
+          $evidenceIv = [Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $plain = [IO.File]::ReadAllBytes($zipPath)
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $evidenceIv
+            $encryptor = $aes.CreateEncryptor()
+            try {
+              $cipher = $encryptor.TransformFinalBlock($plain, 0, $plain.Length)
+            }
+            finally {
+              $encryptor.Dispose()
+            }
+          }
+          finally {
+            $aes.Dispose()
+          }
+
+          $sealed = Join-Path $PWD 'sealed-winhttp-evidence'
+          New-Item -ItemType Directory -Force -Path $sealed | Out-Null
+          $cipherPath = Join-Path $sealed 'evidence.enc'
+          [IO.File]::WriteAllBytes($cipherPath, $cipher)
+          [Convert]::ToHexString($evidenceIv).ToLowerInvariant() |
+            Set-Content -Encoding ascii (Join-Path $sealed 'evidence.iv.hex')
+          $plainHash |
+            Set-Content -Encoding ascii (Join-Path $sealed 'evidence.plain.sha256')
+          (Get-FileHash -Algorithm SHA256 -LiteralPath $cipherPath).Hash.ToLowerInvariant() |
+            Set-Content -Encoding ascii (Join-Path $sealed 'evidence.cipher.sha256')
+          @(
+            'FORMAT=ZDB-AES-256-CBC-PKCS7-V1',
+            'SDK=${{ matrix.sdk }}',
+            'REPEAT=${{ matrix.repeat }}',
+            'RUN_ID=${{ github.run_id }}',
+            'RUN_ATTEMPT=${{ github.run_attempt }}',
+            'JOB=${{ github.job }}',
+            'SOURCE_SHA=${{ github.sha }}'
+          ) | Set-Content -Encoding ascii (Join-Path $sealed 'metadata.txt')
+
+          Write-Host "SEALED_EVIDENCE=PASS sdk=${{ matrix.sdk }} repeat=${{ matrix.repeat }}"
+          Remove-Item -LiteralPath $zipPath,$runtimeKeyPath -Force -ErrorAction SilentlyContinue
+          foreach ($dir in $evidenceDirs) {
+            Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          [Array]::Clear($plain, 0, $plain.Length)
+          [Array]::Clear($payloadKey, 0, $payloadKey.Length)
+
+      - name: Upload sealed evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: winhttp-scope-${{ matrix.sdk }}-r${{ matrix.repeat }}-${{ github.run_id }}
+          path: sealed-winhttp-evidence
+          if-no-files-found: error
+          retention-days: 3
