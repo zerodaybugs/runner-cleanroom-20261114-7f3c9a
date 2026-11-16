@@ -1,0 +1,208 @@
+name: Encrypted DiaSymReader LF_DECIMAL V4
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  decimal-fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk: '10.0.404'
+            tfm: 'net10.0'
+            runtime: '10.0.15'
+            repeat: 1
+            heap_mode: 'normal'
+          - sdk: '10.0.404'
+            tfm: 'net10.0'
+            runtime: '10.0.15'
+            repeat: 2
+            heap_mode: 'pageheap'
+          - sdk: '11.0.100'
+            tfm: 'net11.0'
+            runtime: '11.0.0'
+            repeat: 1
+            heap_mode: 'normal'
+          - sdk: '11.0.100'
+            tfm: 'net11.0'
+            runtime: '11.0.0'
+            repeat: 2
+            heap_mode: 'pageheap'
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Unwrap and execute private LF_DECIMAL payload
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          SDK_VERSION: ${{ matrix.sdk }}
+          TARGET_TFM: ${{ matrix.tfm }}
+          RUNTIME_VERSION: ${{ matrix.runtime }}
+          REPEAT_ID: ${{ matrix.repeat }}
+          HEAP_MODE: ${{ matrix.heap_mode }}
+          EXPECTED_NATIVE_SHA256: ad3e85687b8d2d2eb09d1f097fdf7095372dbb044db5b64179f2d4b8024fed2b
+          DOTNET_NOLOGO: '1'
+          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WRAPPING_KEY_B64)) { throw 'wrapping key missing' }
+
+          $wrappingKey = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
+          if ($wrappingKey.Length -ne 32) { throw 'wrapping key length invalid' }
+          $wrappedPrivate = [IO.File]::ReadAllBytes((Join-Path $PWD 'bootstrap/private.pem.enc'))
+          $wrapIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'bootstrap/private.iv.hex') -Raw).Trim())
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $wrappingKey
+            $aes.IV = $wrapIv
+            $decryptor = $aes.CreateDecryptor()
+            try {
+              $privatePemBytes = $decryptor.TransformFinalBlock($wrappedPrivate, 0, $wrappedPrivate.Length)
+            } finally {
+              $decryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+
+          $bootstrapRsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $bootstrapRsa.ImportFromPem([Text.Encoding]::ASCII.GetString($privatePemBytes))
+            $wrappedEvidenceKey = [Convert]::FromBase64String((Get-Content -LiteralPath (Join-Path $PWD 'dia-v3.key.enc.b64') -Raw).Trim())
+            $evidenceKey = $bootstrapRsa.Decrypt($wrappedEvidenceKey, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          } finally {
+            $bootstrapRsa.Dispose()
+          }
+          if ($evidenceKey.Length -ne 32) { throw 'evidence key length invalid' }
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'dia-v4.runtime.key'), $evidenceKey)
+
+          $cipher = [Convert]::FromBase64String((Get-Content -LiteralPath (Join-Path $PWD 'dia-v4.enc.b64') -Raw).Trim())
+          $cipherHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($cipher)).ToLowerInvariant()
+          $expectedCipherHash = (Get-Content -LiteralPath (Join-Path $PWD 'dia-v4.cipher.sha256') -Raw).Trim().ToLowerInvariant()
+          if ($cipherHash -ne $expectedCipherHash) { throw "cipher hash mismatch: $cipherHash" }
+          $payloadIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'dia-v4.iv.hex') -Raw).Trim())
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $evidenceKey
+            $aes.IV = $payloadIv
+            $decryptor = $aes.CreateDecryptor()
+            try {
+              $plain = $decryptor.TransformFinalBlock($cipher, 0, $cipher.Length)
+            } finally {
+              $decryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+
+          $payloadZip = Join-Path $PWD 'dia-v4.zip'
+          [IO.File]::WriteAllBytes($payloadZip, $plain)
+          $actualPlainHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadZip).Hash.ToLowerInvariant()
+          $expectedPlainHash = (Get-Content -LiteralPath (Join-Path $PWD 'dia-v4.plain.sha256') -Raw).Trim().ToLowerInvariant()
+          if ($actualPlainHash -ne $expectedPlainHash) { throw "plaintext hash mismatch: $actualPlainHash" }
+
+          $payloadDir = Join-Path $PWD 'dia-v4-payload'
+          Expand-Archive -LiteralPath $payloadZip -DestinationPath $payloadDir -Force
+          & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $payloadDir 'decimal_run.ps1')
+          if ($LASTEXITCODE -ne 0) { throw "payload failed: $LASTEXITCODE" }
+
+          [Array]::Clear($evidenceKey, 0, $evidenceKey.Length)
+          [Array]::Clear($privatePemBytes, 0, $privatePemBytes.Length)
+          [Array]::Clear($wrappingKey, 0, $wrappingKey.Length)
+
+      - name: Seal LF_DECIMAL evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $keyPath = Join-Path $PWD 'dia-v4.runtime.key'
+          $dirs = @(Get-ChildItem -LiteralPath $PWD -Directory -Filter 'evidence-diasymreader-decimal-v4-*')
+          if ($dirs.Count -eq 0) {
+            $fallback = Join-Path $PWD 'evidence-diasymreader-decimal-v4-fallback'
+            New-Item -ItemType Directory -Force -Path $fallback | Out-Null
+            @(
+              'NO_EVIDENCE_DIRECTORY',
+              "SDK=${{ matrix.sdk }}",
+              "TFM=${{ matrix.tfm }}",
+              "RUNTIME=${{ matrix.runtime }}",
+              "HEAP_MODE=${{ matrix.heap_mode }}"
+            ) | Set-Content (Join-Path $fallback 'status.txt') -Encoding ascii
+            $dirs = @((Get-Item -LiteralPath $fallback))
+          }
+          if (-not (Test-Path -LiteralPath $keyPath)) { throw 'evidence key unavailable' }
+
+          $zipPath = Join-Path $PWD 'decimal-evidence-v4.plain.zip'
+          Compress-Archive -Path $dirs.FullName -DestinationPath $zipPath -Force
+          $plainHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
+          $evidenceKey = [IO.File]::ReadAllBytes($keyPath)
+          $evidenceIv = [Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $plain = [IO.File]::ReadAllBytes($zipPath)
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $evidenceKey
+            $aes.IV = $evidenceIv
+            $encryptor = $aes.CreateEncryptor()
+            try {
+              $encrypted = $encryptor.TransformFinalBlock($plain, 0, $plain.Length)
+            } finally {
+              $encryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+
+          $sealed = Join-Path $PWD 'sealed-decimal-evidence-v4'
+          New-Item -ItemType Directory -Force -Path $sealed | Out-Null
+          $cipherPath = Join-Path $sealed 'evidence.enc'
+          [IO.File]::WriteAllBytes($cipherPath, $encrypted)
+          [Convert]::ToHexString($evidenceIv).ToLowerInvariant() | Set-Content (Join-Path $sealed 'evidence.iv.hex') -Encoding ascii
+          $plainHash | Set-Content (Join-Path $sealed 'evidence.plain.sha256') -Encoding ascii
+          (Get-FileHash -Algorithm SHA256 -LiteralPath $cipherPath).Hash.ToLowerInvariant() | Set-Content (Join-Path $sealed 'evidence.cipher.sha256') -Encoding ascii
+          @(
+            'FORMAT=ZDB-AES-256-CBC-PKCS7-V1',
+            'PAYLOAD=dia-v4-lf-decimal',
+            'SDK=${{ matrix.sdk }}',
+            'TFM=${{ matrix.tfm }}',
+            'RUNTIME=${{ matrix.runtime }}',
+            'REPEAT=${{ matrix.repeat }}',
+            'HEAP_MODE=${{ matrix.heap_mode }}',
+            'RUN_ID=${{ github.run_id }}',
+            'SOURCE_SHA=${{ github.sha }}'
+          ) | Set-Content (Join-Path $sealed 'metadata.txt') -Encoding ascii
+
+          Remove-Item -LiteralPath $zipPath,$keyPath,(Join-Path $PWD 'dia-v4.zip') -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath (Join-Path $PWD 'dia-v4-payload') -Recurse -Force -ErrorAction SilentlyContinue
+          foreach ($dir in $dirs) { Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+          [Array]::Clear($evidenceKey, 0, $evidenceKey.Length)
+
+      - name: Upload sealed LF_DECIMAL evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diasymreader-lf-decimal-v4-${{ matrix.runtime }}-${{ matrix.heap_mode }}-r${{ matrix.repeat }}
+          path: sealed-decimal-evidence-v4
+          if-no-files-found: error
+          retention-days: 3
