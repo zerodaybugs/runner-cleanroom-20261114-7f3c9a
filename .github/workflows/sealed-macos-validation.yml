@@ -1,0 +1,57 @@
+name: Sealed macOS exact-SDK validation
+
+on:
+  push:
+    branches:
+      - research/vstest-macos-sealed-20261116
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ['10.0.404', '11.0.100']
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Run sealed validation
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          SDK_VERSION: ${{ matrix.sdk }}
+        run: |
+          ./scripts/run-sealed-payload.ps1 -PayloadPrefix 'vstest-macos-v1' -OutputPath (Join-Path $PWD 'vstest-macos-v1.payload.sh')
+          & /bin/chmod 0700 (Join-Path $PWD 'vstest-macos-v1.payload.sh')
+          & /bin/bash (Join-Path $PWD 'vstest-macos-v1.payload.sh')
+          if ($LASTEXITCODE -ne 0) { throw "sealed validation failed: $LASTEXITCODE" }
+
+      - name: Seal private evidence
+        if: always()
+        shell: pwsh
+        run: |
+          ./scripts/seal-evidence.ps1 `
+            -PayloadPrefix 'vstest-macos-v1' `
+            -EvidenceFilter 'evidence-vstest-macos-*' `
+            -OutputDirectory (Join-Path $PWD 'sealed-evidence') `
+            -Metadata 'SDK=${{ matrix.sdk }};RUN_ID=${{ github.run_id }};SOURCE_SHA=${{ github.sha }}'
+          Remove-Item -LiteralPath (Join-Path $PWD 'vstest-macos-v1.payload.sh') -Force -ErrorAction SilentlyContinue
+          Write-Host "SEALED_EVIDENCE=PASS SDK=${{ matrix.sdk }}"
+
+      - name: Upload sealed evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vstest-macos-sealed-${{ matrix.sdk }}
+          path: sealed-evidence
+          if-no-files-found: error
+          retention-days: 3
