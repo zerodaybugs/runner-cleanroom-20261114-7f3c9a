@@ -25,12 +25,12 @@ jobs:
             runtime: 10.0.15
             tfm: net10.0
             project: Probe.net10.csproj
-            executable: Probe.net10.exe
+            executable: Probe.exe
           - sdk: 11.0.100
             runtime: 11.0.0
             tfm: net11.0
             project: Probe.net11.csproj
-            executable: Probe.net11.exe
+            executable: Probe.exe
 
     steps:
       - name: Checkout candidate branch
