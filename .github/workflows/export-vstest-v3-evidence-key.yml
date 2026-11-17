@@ -1,4 +1,5 @@
 name: Export VSTest v6 Evidence Key
+# Researcher public-key SHA-256: 7169d0db294688b8b1da20f7be62eaa511bb180a16c30fc01fc90afbff024b79
 
 on:
   push:
