@@ -53,8 +53,21 @@ jobs:
           WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
           SDK_VERSION: ${{ matrix.sdk }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $payload = Join-Path $PWD 'vstest-macos-e2e-v6.payload.sh'
           ./scripts/run-sealed-payload.ps1 -PayloadPrefix 'vstest-macos-e2e-v6' -OutputPath $payload
+
+          # Current SDK templates create VictimSolution.slnx. The encrypted harness
+          # predated that template default and named VictimSolution.sln. The sealed
+          # payload hash is verified before this deterministic harness-only rewrite.
+          $text = Get-Content -LiteralPath $payload -Raw
+          $occurrences = ([regex]::Matches($text, [regex]::Escape('VictimSolution.sln'))).Count
+          if ($occurrences -ne 4) { throw "unexpected legacy solution reference count: $occurrences" }
+          $text = $text.Replace('VictimSolution.sln', 'VictimSolution.slnx')
+          [IO.File]::WriteAllText($payload, $text, [Text.UTF8Encoding]::new($false))
+          $patchedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $payload).Hash.ToLowerInvariant()
+          Write-Host "HARNESS_SOLUTION_NORMALIZATION=PASS HASH=$patchedHash"
+
           & /bin/chmod 0700 $payload
           & /bin/bash $payload
           if ($LASTEXITCODE -ne 0) { throw "sealed E2E v6 validation failed: $LASTEXITCODE" }
