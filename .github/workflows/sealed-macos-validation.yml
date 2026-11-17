@@ -8,7 +8,7 @@ on:
       - '.github/workflows/sealed-macos-validation.yml'
       - 'scripts/run-sealed-payload.ps1'
       - 'scripts/seal-evidence.ps1'
-      - 'vstest-macos-e2e-v5.*'
+      - 'vstest-macos-e2e-v6.*'
   workflow_dispatch:
 
 permissions:
@@ -29,35 +29,53 @@ jobs:
         with:
           dotnet-version: ${{ matrix.sdk }}
 
+      - name: Verify and assemble sealed payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & /usr/bin/shasum -a 256 -c (Join-Path $PWD 'vstest-macos-e2e-v6.parts.sha256')
+          if ($LASTEXITCODE -ne 0) { throw 'ciphertext part manifest verification failed' }
+
+          $parts = Get-ChildItem -Path (Join-Path $PWD 'vstest-macos-e2e-v6.enc.part*') | Sort-Object Name
+          if ($parts.Count -ne 5) { throw "unexpected ciphertext part count: $($parts.Count)" }
+          $joined = ($parts | ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw).Trim() }) -join ''
+          $cipher = [Convert]::FromBase64String($joined)
+          $cipherHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($cipher)).ToLowerInvariant()
+          if ($cipherHash -ne '31545877a906d4a7a528543ef88e07eb79eb7c4a8281766cc2e93e14fe7cb33b') {
+            throw "assembled ciphertext hash mismatch: $cipherHash"
+          }
+          [IO.File]::WriteAllText((Join-Path $PWD 'vstest-macos-e2e-v6.enc.b64'), $joined, [Text.Encoding]::ASCII)
+          Write-Host 'MULTIPART_PAYLOAD_VERIFIED=PASS'
+
       - name: Run sealed E2E validation
         shell: pwsh
         env:
           WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
           SDK_VERSION: ${{ matrix.sdk }}
         run: |
-          $payload = Join-Path $PWD 'vstest-macos-e2e-v5.payload.sh'
-          ./scripts/run-sealed-payload.ps1 -PayloadPrefix 'vstest-macos-e2e-v5' -OutputPath $payload
+          $payload = Join-Path $PWD 'vstest-macos-e2e-v6.payload.sh'
+          ./scripts/run-sealed-payload.ps1 -PayloadPrefix 'vstest-macos-e2e-v6' -OutputPath $payload
           & /bin/chmod 0700 $payload
           & /bin/bash $payload
-          if ($LASTEXITCODE -ne 0) { throw "sealed E2E v5 validation failed: $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "sealed E2E v6 validation failed: $LASTEXITCODE" }
 
       - name: Seal private evidence
         if: always()
         shell: pwsh
         run: |
           ./scripts/seal-evidence.ps1 `
-            -PayloadPrefix 'vstest-macos-e2e-v5' `
-            -EvidenceFilter 'evidence-vstest-macos-e2e-v5-*' `
+            -PayloadPrefix 'vstest-macos-e2e-v6' `
+            -EvidenceFilter 'evidence-vstest-macos-e2e-v6-*' `
             -OutputDirectory (Join-Path $PWD 'sealed-evidence') `
             -Metadata 'SDK=${{ matrix.sdk }};RUN_ID=${{ github.run_id }};SOURCE_SHA=${{ github.sha }}'
-          Remove-Item -LiteralPath (Join-Path $PWD 'vstest-macos-e2e-v5.payload.sh') -Force -ErrorAction SilentlyContinue
-          Write-Host "SEALED_E2E_V5_EVIDENCE=PASS SDK=${{ matrix.sdk }}"
+          Remove-Item -LiteralPath (Join-Path $PWD 'vstest-macos-e2e-v6.enc.b64'),(Join-Path $PWD 'vstest-macos-e2e-v6.payload.sh') -Force -ErrorAction SilentlyContinue
+          Write-Host "SEALED_E2E_V6_EVIDENCE=PASS SDK=${{ matrix.sdk }}"
 
       - name: Upload sealed evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vstest-macos-e2e-sealed-v5-${{ matrix.sdk }}
+          name: vstest-macos-e2e-sealed-v6-${{ matrix.sdk }}
           path: sealed-evidence
           if-no-files-found: error
           retention-days: 3
