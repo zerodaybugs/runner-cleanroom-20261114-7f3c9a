@@ -65,10 +65,19 @@ jobs:
           [Convert]::ToBase64String($sealedKey) | Set-Content -LiteralPath (Join-Path $out 'vstest-v6-key.rsa-oaep-sha256.b64') -Encoding ascii
           (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PWD 'bootstrap/vstest-evidence-researcher-public.pem')).Hash.ToLowerInvariant() | Set-Content -LiteralPath (Join-Path $out 'researcher-public-pem.sha256') -Encoding ascii
           [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($payloadKey)).ToLowerInvariant() | Set-Content -LiteralPath (Join-Path $out 'payload-key.sha256') -Encoding ascii
+
+          $parts = Get-ChildItem -Path (Join-Path $PWD 'vstest-macos-e2e-v6.enc.part*') | Sort-Object Name
+          if ($parts.Count -ne 5) { throw "unexpected ciphertext part count: $($parts.Count)" }
+          $joinedCiphertext = ($parts | ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw).Trim() }) -join ''
+          [IO.File]::WriteAllText((Join-Path $out 'vstest-macos-e2e-v6.enc.b64'), $joinedCiphertext, [Text.Encoding]::ASCII)
+          Copy-Item -LiteralPath (Join-Path $PWD 'vstest-macos-e2e-v6.iv.hex') -Destination $out
+          Copy-Item -LiteralPath (Join-Path $PWD 'vstest-macos-e2e-v6.plain.sha256') -Destination $out
+
           @(
             'FORMAT=RSA-OAEP-SHA256',
             'PLAINTEXT_LENGTH=32',
             'SOURCE_KEY=vstest-macos-e2e-v6.key.enc.b64',
+            'CIPHERTEXT_SOURCE=vstest-macos-e2e-v6.enc.part00..04',
             'RUN_ID=${{ github.run_id }}',
             'SOURCE_SHA=${{ github.sha }}'
           ) | Set-Content -LiteralPath (Join-Path $out 'metadata.txt') -Encoding ascii
