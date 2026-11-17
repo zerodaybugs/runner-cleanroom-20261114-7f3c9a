@@ -1,0 +1,95 @@
+name: NamedPipe Shipped IL Audit 20261117
+
+on:
+  push:
+    branches:
+      - research/namedpipe-residual-20261116
+    paths:
+      - .github/workflows/namedpipe-shipped-il-audit-20261117.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk: 10.0.404
+            runtime: 10.0.15
+          - sdk: 11.0.100
+            runtime: 11.0.0
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Record exact installed release and assembly
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path evidence | Out-Null
+          dotnet --info | Tee-Object -FilePath evidence/dotnet-info.txt
+          dotnet --list-sdks | Tee-Object -FilePath evidence/list-sdks.txt
+          dotnet --list-runtimes | Tee-Object -FilePath evidence/list-runtimes.txt
+          $assembly = Join-Path $env:DOTNET_ROOT "shared/Microsoft.AspNetCore.App/${{ matrix.runtime }}/Microsoft.AspNetCore.Server.Kestrel.Transport.NamedPipes.dll"
+          if (-not (Test-Path -LiteralPath $assembly)) { throw "assembly not found: $assembly" }
+          $item = Get-Item -LiteralPath $assembly
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $assembly).Hash.ToLowerInvariant()
+          $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($assembly)
+          @(
+            "SDK=${{ matrix.sdk }}",
+            "RUNTIME=${{ matrix.runtime }}",
+            "ASSEMBLY=$assembly",
+            "BYTES=$($item.Length)",
+            "SHA256=$hash",
+            "FILE_VERSION=$($version.FileVersion)",
+            "PRODUCT_VERSION=$($version.ProductVersion)"
+          ) | Set-Content -LiteralPath evidence/assembly.txt -Encoding utf8
+
+      - name: Decompile shipped recovery path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet tool install --global ilspycmd
+          $env:PATH = "$env:PATH;$env:USERPROFILE/.dotnet/tools"
+          $assembly = Join-Path $env:DOTNET_ROOT "shared/Microsoft.AspNetCore.App/${{ matrix.runtime }}/Microsoft.AspNetCore.Server.Kestrel.Transport.NamedPipes.dll"
+          $type = 'Microsoft.AspNetCore.Server.Kestrel.Transport.NamedPipes.Internal.NamedPipeConnectionListener'
+          & ilspycmd -t $type $assembly | Tee-Object -FilePath evidence/NamedPipeConnectionListener.decompiled.cs
+          if ($LASTEXITCODE -ne 0) { throw "ilspycmd failed: $LASTEXITCODE" }
+
+          $text = Get-Content -LiteralPath evidence/NamedPipeConnectionListener.decompiled.cs -Raw
+          $catch = $text.IndexOf('catch (IOException', [StringComparison]::Ordinal)
+          if ($catch -lt 0) { throw 'IOException catch not found' }
+          $segmentLength = [Math]::Min(2400, $text.Length - $catch)
+          $segment = $text.Substring($catch, $segmentLength)
+          $dispose = $segment.IndexOf('Dispose()', [StringComparison]::Ordinal)
+          $get = $segment.IndexOf('_namedPipeServerStreamPool.Get()', [StringComparison]::Ordinal)
+          $patchedComment = $segment.IndexOf('Create a new pipe and continue accepting', [StringComparison]::Ordinal)
+          $legacyComment = $segment.IndexOf('Dispose existing pipe, create a new one', [StringComparison]::Ordinal)
+          @(
+            "CATCH_INDEX=$catch",
+            "SEGMENT_DISPOSE_INDEX=$dispose",
+            "SEGMENT_GET_INDEX=$get",
+            "PATCHED_COMMENT_INDEX=$patchedComment",
+            "LEGACY_COMMENT_INDEX=$legacyComment",
+            "DISPOSE_BEFORE_GET=$($dispose -ge 0 -and $get -ge 0 -and $dispose -lt $get)",
+            "GET_BEFORE_DISPOSE=$($dispose -ge 0 -and $get -ge 0 -and $get -lt $dispose)"
+          ) | Set-Content -LiteralPath evidence/order.txt -Encoding utf8
+          $segment | Set-Content -LiteralPath evidence/recovery-segment.txt -Encoding utf8
+          Get-Content evidence/assembly.txt
+          Get-Content evidence/order.txt
+
+      - name: Upload exact shipped IL evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: namedpipe-shipped-il-${{ matrix.runtime }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 7
