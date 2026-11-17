@@ -1,0 +1,87 @@
+name: Export VSTest v3 Evidence Key
+
+on:
+  push:
+    branches:
+      - research/vstest-macos-sealed-20261116
+    paths:
+      - '.github/workflows/export-vstest-v3-evidence-key.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Re-wrap VSTest v3 payload and evidence key
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WRAPPING_KEY_B64)) { throw 'wrapping key missing' }
+
+          $wrappingKey = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
+          if ($wrappingKey.Length -ne 32) { throw 'wrapping key length invalid' }
+          $wrappedPrivate = [IO.File]::ReadAllBytes((Join-Path $PWD 'bootstrap/private.pem.enc'))
+          $wrapIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'bootstrap/private.iv.hex') -Raw).Trim())
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $wrappingKey
+            $aes.IV = $wrapIv
+            $decryptor = $aes.CreateDecryptor()
+            try { $privatePemBytes = $decryptor.TransformFinalBlock($wrappedPrivate, 0, $wrappedPrivate.Length) }
+            finally { $decryptor.Dispose() }
+          }
+          finally { $aes.Dispose() }
+
+          $bootstrapRsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $bootstrapRsa.ImportFromPem([Text.Encoding]::ASCII.GetString($privatePemBytes))
+            $wrappedPayloadKey = [Convert]::FromBase64String((Get-Content -LiteralPath (Join-Path $PWD 'vstest-macos-e2e-v3.key.enc.b64') -Raw).Trim())
+            $payloadKey = $bootstrapRsa.Decrypt($wrappedPayloadKey, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          }
+          finally { $bootstrapRsa.Dispose() }
+          if ($payloadKey.Length -ne 32) { throw 'payload key length invalid' }
+
+          $researcherRsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $researcherPem = Get-Content -LiteralPath (Join-Path $PWD 'bootstrap/vstest-evidence-researcher-public.pem') -Raw
+            $researcherRsa.ImportFromPem($researcherPem)
+            $sealedKey = $researcherRsa.Encrypt($payloadKey, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          }
+          finally { $researcherRsa.Dispose() }
+
+          $out = Join-Path $PWD 'vstest-v3-key-export'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          [Convert]::ToBase64String($sealedKey) | Set-Content -LiteralPath (Join-Path $out 'vstest-v3-key.rsa-oaep-sha256.b64') -Encoding ascii
+          (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PWD 'bootstrap/vstest-evidence-researcher-public.pem')).Hash.ToLowerInvariant() | Set-Content -LiteralPath (Join-Path $out 'researcher-public-pem.sha256') -Encoding ascii
+          [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($payloadKey)).ToLowerInvariant() | Set-Content -LiteralPath (Join-Path $out 'payload-key.sha256') -Encoding ascii
+          @(
+            'FORMAT=RSA-OAEP-SHA256',
+            'PLAINTEXT_LENGTH=32',
+            'SOURCE_KEY=vstest-macos-e2e-v3.key.enc.b64',
+            'RUN_ID=${{ github.run_id }}',
+            'SOURCE_SHA=${{ github.sha }}'
+          ) | Set-Content -LiteralPath (Join-Path $out 'metadata.txt') -Encoding ascii
+
+          [Array]::Clear($payloadKey, 0, $payloadKey.Length)
+          [Array]::Clear($privatePemBytes, 0, $privatePemBytes.Length)
+          [Array]::Clear($wrappingKey, 0, $wrappingKey.Length)
+          Write-Host 'VSTEST_V3_KEY_EXPORT=PASS'
+
+      - name: Upload encrypted key export
+        uses: actions/upload-artifact@v4
+        with:
+          name: vstest-v3-key-for-researcher
+          path: vstest-v3-key-export
+          if-no-files-found: error
+          retention-days: 1
