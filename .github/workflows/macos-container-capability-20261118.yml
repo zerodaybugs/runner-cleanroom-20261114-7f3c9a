@@ -1,0 +1,49 @@
+name: macOS container capability 20261118
+
+on:
+  push:
+    branches:
+      - research/macos-capability-probe-20261118
+    paths:
+      - '.github/workflows/macos-container-capability-20261118.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe runner capabilities
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo '=== SYSTEM ==='
+          sw_vers
+          uname -a
+          sysctl kern.hv_support 2>&1 || true
+          sysctl -n machdep.cpu.brand_string 2>&1 || true
+          echo '=== TOOLS ==='
+          for x in docker podman colima limactl qemu-system-x86_64 brew; do
+            printf '%s=' "$x"
+            command -v "$x" || true
+          done
+          echo '=== DOCKER ==='
+          docker version 2>&1 || true
+          docker info 2>&1 || true
+          echo '=== PODMAN ==='
+          podman version 2>&1 || true
+          podman machine list 2>&1 || true
+          echo '=== COLIMA ==='
+          colima version 2>&1 || true
+          colima status 2>&1 || true
+          echo '=== HOMEBREW CASKS/FORMULAE ==='
+          brew list --formula 2>&1 | grep -E '^(docker|docker-compose|colima|lima|podman|qemu)$' || true
+          brew list --cask 2>&1 | grep -E '^(docker|podman-desktop)$' || true
+          echo '=== NETWORK ==='
+          dscacheutil -q host -a name host.docker.internal 2>&1 || true
+          route -n get default 2>&1 || true
+          echo 'CAPABILITY_PROBE_COMPLETE=PASS'
