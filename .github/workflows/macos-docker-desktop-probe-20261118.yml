@@ -1,0 +1,61 @@
+name: macOS Docker Desktop capability 20261118
+
+on:
+  push:
+    branches:
+      - research/docker-desktop-probe-20261118
+    paths:
+      - '.github/workflows/macos-docker-desktop-probe-20261118.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install and start Docker Desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -a
+          sysctl kern.hv_support
+          brew install --cask docker
+          open -gj -a Docker
+          ready=0
+          for i in $(seq 1 120); do
+            if docker info >/tmp/docker-info.txt 2>/tmp/docker-info.err; then
+              ready=1
+              break
+            fi
+            sleep 5
+          done
+          cat /tmp/docker-info.err || true
+          if [ "$ready" -ne 1 ]; then
+            echo 'DOCKER_DESKTOP_READY=FAIL'
+            find "$HOME/Library/Containers/com.docker.docker" -maxdepth 4 -type f -name '*.log' -print -exec tail -n 100 {} \; 2>/dev/null || true
+            exit 41
+          fi
+          echo 'DOCKER_DESKTOP_READY=PASS'
+          docker version
+          cat /tmp/docker-info.txt
+          python3 -m http.server 18080 --bind 0.0.0.0 >/tmp/host-http.log 2>&1 &
+          host_pid=$!
+          trap 'kill $host_pid 2>/dev/null || true; osascript -e '\''quit app "Docker"'\'' 2>/dev/null || true' EXIT
+          sleep 2
+          curl -fsS http://127.0.0.1:18080/ >/dev/null
+          set +e
+          docker run --rm alpine:3.22 sh -c 'apk add --no-cache curl >/dev/null; getent hosts host.docker.internal; curl -sv --max-time 10 http://host.docker.internal:18080/' 2>&1 | tee /tmp/container-to-host.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          cat /tmp/host-http.log || true
+          echo "CONTAINER_TO_HOST_RC=$rc"
+          if [ "$rc" -ne 0 ]; then
+            echo 'DOCKER_DESKTOP_HOST_REACHABILITY=FAIL'
+            exit 42
+          fi
+          echo 'DOCKER_DESKTOP_HOST_REACHABILITY=PASS'
