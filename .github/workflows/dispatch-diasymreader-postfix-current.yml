@@ -1,0 +1,25 @@
+name: Dispatch DiaSymReader Post-Fix Current Matrix
+
+on:
+  push:
+    paths:
+      - 'triggers/diasymreader-postfix-current-20261118.txt'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch encrypted current-GA matrix
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'encrypted-diasymreader-postfix.yml',
+              ref: context.ref.replace('refs/heads/', '')
+            });
