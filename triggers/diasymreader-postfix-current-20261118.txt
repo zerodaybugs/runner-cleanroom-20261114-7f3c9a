@@ -1,0 +1,6 @@
+UTC=2026-11-18T20:30:00Z
+PURPOSE=current-GA post-fix residual memory-safety validation
+SDK10=10.0.404
+RUNTIME10=10.0.15
+SDK11=11.0.100
+RUNTIME11=11.0.0
