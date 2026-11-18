@@ -25,7 +25,12 @@ jobs:
           uname -a
           sysctl kern.hv_support
           brew install --cask docker
-          open -gj -a Docker
+          echo '=== DOCKER APP CONTENTS ==='
+          find /Applications/Docker.app/Contents/MacOS -maxdepth 1 -type f -print | sort
+          if [ -x /Applications/Docker.app/Contents/MacOS/install ]; then
+            sudo /Applications/Docker.app/Contents/MacOS/install --accept-license --user="$USER" || true
+          fi
+          open -gj /Applications/Docker.app
           ready=0
           for i in $(seq 1 120); do
             if docker info >/tmp/docker-info.txt 2>/tmp/docker-info.err; then
@@ -37,7 +42,8 @@ jobs:
           cat /tmp/docker-info.err || true
           if [ "$ready" -ne 1 ]; then
             echo 'DOCKER_DESKTOP_READY=FAIL'
-            find "$HOME/Library/Containers/com.docker.docker" -maxdepth 4 -type f -name '*.log' -print -exec tail -n 100 {} \; 2>/dev/null || true
+            ps aux | grep -i '[D]ocker' || true
+            find "$HOME/Library/Containers/com.docker.docker" -maxdepth 5 -type f -name '*.log' -print -exec tail -n 100 {} \; 2>/dev/null || true
             exit 41
           fi
           echo 'DOCKER_DESKTOP_READY=PASS'
