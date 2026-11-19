@@ -1,0 +1,108 @@
+name: Sealed Windows TemplateEngine TOCTOU validation
+
+on:
+  push:
+    branches:
+      - research/templateengine-windows-sealed-20261119-v1
+    paths:
+      - '.github/workflows/templateengine-windows-validation.yml'
+      - 'templateengine-windows-v1.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ['10.0.404', '11.0.100']
+    runs-on: windows-2025
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Verify sealed payload transport
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = 'templateengine-windows-v1'
+          $cipher = [Convert]::FromBase64String((Get-Content -LiteralPath "$prefix.enc.b64" -Raw).Trim())
+          $actual = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($cipher)).ToLowerInvariant()
+          $expected = (Get-Content -LiteralPath "$prefix.cipher.sha256" -Raw).Trim().ToLowerInvariant()
+          if ($actual -ne $expected) { throw "ciphertext hash mismatch" }
+          Write-Host 'SEALED_PAYLOAD_TRANSPORT=PASS'
+
+      - name: Run private Windows validation
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          SDK_VERSION: ${{ matrix.sdk }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $payloadGz = Join-Path $PWD 'templateengine-windows-v1.payload.ps1.gz'
+          $payload = Join-Path $PWD 'templateengine-windows-v1.payload.ps1'
+          ./scripts/run-sealed-payload.ps1 -PayloadPrefix 'templateengine-windows-v1' -OutputPath $payloadGz
+          $input = [IO.File]::OpenRead($payloadGz)
+          try {
+            $gzip = [IO.Compression.GZipStream]::new($input, [IO.Compression.CompressionMode]::Decompress)
+            try {
+              $output = [IO.File]::Create($payload)
+              try { $gzip.CopyTo($output) } finally { $output.Dispose() }
+            } finally { $gzip.Dispose() }
+          } finally { $input.Dispose() }
+          try {
+            & pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File $payload
+            if ($LASTEXITCODE -ne 0) { throw "private validation failed: $LASTEXITCODE" }
+          }
+          finally {
+            Remove-Item -LiteralPath $payload,$payloadGz -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Seal private evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = 'templateengine-windows-v1'
+          $runtimeKeyPath = Join-Path $PWD "$prefix.runtime.key"
+          if (-not (Test-Path -LiteralPath $runtimeKeyPath)) { throw 'runtime evidence key unavailable' }
+
+          $publicPemPath = Join-Path $PWD 'templateengine-windows-researcher-public.pem'
+          $publicPem = Get-Content -LiteralPath $publicPemPath -Raw
+          $rsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $rsa.ImportFromPem($publicPem)
+            $runtimeKey = [IO.File]::ReadAllBytes($runtimeKeyPath)
+            $wrappedResearcherKey = $rsa.Encrypt($runtimeKey, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          }
+          finally { $rsa.Dispose() }
+          $wrappedResearcherKeyB64 = [Convert]::ToBase64String($wrappedResearcherKey)
+          $wrappedResearcherKeyHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($wrappedResearcherKey)).ToLowerInvariant()
+          $researcherPublicHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $publicPemPath).Hash.ToLowerInvariant()
+
+          $sealedDir = Join-Path $PWD 'sealed-templateengine-evidence'
+          ./scripts/seal-evidence.ps1 `
+            -PayloadPrefix $prefix `
+            -EvidenceFilter 'evidence-templateengine-windows-*' `
+            -OutputDirectory $sealedDir `
+            -Metadata 'SDK=${{ matrix.sdk }};RUN_ID=${{ github.run_id }};SOURCE_SHA=${{ github.sha }};RUNNER=${{ runner.name }}'
+
+          $wrappedResearcherKeyB64 | Set-Content (Join-Path $sealedDir 'researcher-key.enc.b64') -Encoding ascii
+          $wrappedResearcherKeyHash | Set-Content (Join-Path $sealedDir 'researcher-key.cipher.sha256') -Encoding ascii
+          $researcherPublicHash | Set-Content (Join-Path $sealedDir 'researcher-public.sha256') -Encoding ascii
+          Write-Host "SEALED_TEMPLATEENGINE_EVIDENCE=PASS SDK=${{ matrix.sdk }}"
+
+      - name: Upload sealed evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: templateengine-windows-sealed-${{ matrix.sdk }}
+          path: sealed-templateengine-evidence
+          if-no-files-found: error
+          retention-days: 3
