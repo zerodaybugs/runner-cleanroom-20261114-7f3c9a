@@ -1,0 +1,200 @@
+name: Sealed Current-GA Windows Validation
+
+on:
+  push:
+    branches:
+      - research/sealed-current-ga-20261120
+    paths:
+      - '.github/workflows/sealed-current-ga-20261120.yml'
+      - 'sealed-current-ga-20261120/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: net10-ga
+            sdk: 10.0.404
+            runtime: 10.0.15
+            package: 10.0.15
+          - label: net11-ga
+            sdk: 11.0.100
+            runtime: 11.0.0
+            package: 11.0.0
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      NUGET_XMLDOC_MODE: skip
+
+    steps:
+      - name: Checkout sealed research payload
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install exact current-GA SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Unwrap and execute sealed payload
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          if ([string]::IsNullOrWhiteSpace($env:WRAPPING_KEY_B64)) { throw 'wrapping key missing' }
+
+          $sealedRoot = Join-Path $PWD 'sealed-current-ga-20261120'
+          $workRoot = Join-Path $env:RUNNER_TEMP 'zdb-sealed-current-ga'
+          Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
+
+          $wrappingKey = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
+          if ($wrappingKey.Length -ne 32) { throw 'wrapping key length invalid' }
+          $wrappedPrivate = [IO.File]::ReadAllBytes((Join-Path $PWD 'bootstrap/private.pem.enc'))
+          $wrapIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'bootstrap/private.iv.hex') -Raw).Trim())
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $wrappingKey
+            $aes.IV = $wrapIv
+            $decryptor = $aes.CreateDecryptor()
+            try { $privatePemBytes = $decryptor.TransformFinalBlock($wrappedPrivate, 0, $wrappedPrivate.Length) }
+            finally { $decryptor.Dispose() }
+          } finally { $aes.Dispose() }
+
+          $rsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $rsa.ImportFromPem([Text.Encoding]::ASCII.GetString($privatePemBytes))
+            $wrappedPayloadKey = [Convert]::FromBase64String((Get-Content -LiteralPath (Join-Path $sealedRoot 'payload.key.enc.b64') -Raw).Trim())
+            $payloadKey = $rsa.Decrypt($wrappedPayloadKey, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          } finally {
+            $rsa.Dispose()
+            [Array]::Clear($privatePemBytes, 0, $privatePemBytes.Length)
+          }
+          if ($payloadKey.Length -ne 32) { throw 'payload key length invalid' }
+          $runtimeKeyPath = Join-Path $workRoot 'payload.runtime.key'
+          [IO.File]::WriteAllBytes($runtimeKeyPath, $payloadKey)
+
+          $partFiles = @(Get-ChildItem -LiteralPath (Join-Path $sealedRoot 'parts') -File -Filter 'payload.part-*' | Sort-Object Name)
+          if ($partFiles.Count -lt 1) { throw 'sealed payload parts missing' }
+          $payloadB64 = [string]::Concat(@($partFiles | ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw).Trim() }))
+          $payloadCipher = [Convert]::FromBase64String($payloadB64)
+          $expectedCipherHash = (Get-Content -LiteralPath (Join-Path $sealedRoot 'payload.cipher.sha256') -Raw).Trim().ToLowerInvariant()
+          $actualCipherHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($payloadCipher)).ToLowerInvariant()
+          if ($actualCipherHash -ne $expectedCipherHash) { throw "cipher hash mismatch: $actualCipherHash" }
+          $payloadIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $sealedRoot 'payload.iv.hex') -Raw).Trim())
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $payloadIv
+            $decryptor = $aes.CreateDecryptor()
+            try { $payloadPlain = $decryptor.TransformFinalBlock($payloadCipher, 0, $payloadCipher.Length) }
+            finally { $decryptor.Dispose() }
+          } finally { $aes.Dispose() }
+
+          $payloadZip = Join-Path $workRoot 'payload.zip'
+          [IO.File]::WriteAllBytes($payloadZip, $payloadPlain)
+          $expectedPlainHash = (Get-Content -LiteralPath (Join-Path $sealedRoot 'payload.plain.sha256') -Raw).Trim().ToLowerInvariant()
+          $actualPlainHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadZip).Hash.ToLowerInvariant()
+          if ($actualPlainHash -ne $expectedPlainHash) { throw "plain hash mismatch: $actualPlainHash" }
+
+          $payloadDir = Join-Path $workRoot 'payload'
+          Expand-Archive -LiteralPath $payloadZip -DestinationPath $payloadDir -Force
+          foreach ($line in Get-Content -LiteralPath (Join-Path $payloadDir 'PAYLOAD_SHA256SUMS.txt')) {
+            if ($line -notmatch '^([0-9a-f]{64})  (.+)$') { throw "invalid manifest line: $line" }
+            $expected = $Matches[1]
+            $relative = $Matches[2]
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $payloadDir $relative)).Hash.ToLowerInvariant()
+            if ($actual -ne $expected) { throw "payload file hash mismatch: $relative" }
+          }
+
+          $evidence = Join-Path $PWD "evidence-${{ matrix.label }}"
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $stdout = Join-Path $evidence 'execution.stdout.txt'
+          & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $payloadDir 'run.ps1') `
+            -SdkVersion '${{ matrix.sdk }}' `
+            -ExpectedRuntime '${{ matrix.runtime }}' `
+            -PackageVersion '${{ matrix.package }}' `
+            -Label '${{ matrix.label }}' `
+            -EvidenceDirectory $evidence *>&1 | Tee-Object -FilePath $stdout
+          $rc = $LASTEXITCODE
+          "PAYLOAD_EXIT_CODE=$rc" | Add-Content -LiteralPath $stdout -Encoding ascii
+          if ($rc -ne 0) { throw "payload failed: $rc" }
+
+      - name: Seal evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $workRoot = Join-Path $env:RUNNER_TEMP 'zdb-sealed-current-ga'
+          $keyPath = Join-Path $workRoot 'payload.runtime.key'
+          $evidence = Join-Path $PWD "evidence-${{ matrix.label }}"
+          if (-not (Test-Path -LiteralPath $evidence)) {
+            New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+            'NO_EVIDENCE_DIRECTORY' | Set-Content -LiteralPath (Join-Path $evidence 'status.txt') -Encoding ascii
+          }
+          if (-not (Test-Path -LiteralPath $keyPath)) { throw 'payload evidence key unavailable' }
+
+          $zipPath = Join-Path $workRoot 'evidence.plain.zip'
+          Compress-Archive -Path (Join-Path $evidence '*') -DestinationPath $zipPath -Force
+          $plainHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
+          $payloadKey = [IO.File]::ReadAllBytes($keyPath)
+          $evidenceIv = [Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $plain = [IO.File]::ReadAllBytes($zipPath)
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $evidenceIv
+            $encryptor = $aes.CreateEncryptor()
+            try { $cipher = $encryptor.TransformFinalBlock($plain, 0, $plain.Length) }
+            finally { $encryptor.Dispose() }
+          } finally { $aes.Dispose() }
+
+          $sealed = Join-Path $PWD "sealed-evidence-${{ matrix.label }}"
+          New-Item -ItemType Directory -Force -Path $sealed | Out-Null
+          $cipherPath = Join-Path $sealed 'evidence.enc'
+          [IO.File]::WriteAllBytes($cipherPath, $cipher)
+          [Convert]::ToHexString($evidenceIv).ToLowerInvariant() | Set-Content -LiteralPath (Join-Path $sealed 'evidence.iv.hex') -Encoding ascii
+          $plainHash | Set-Content -LiteralPath (Join-Path $sealed 'evidence.plain.sha256') -Encoding ascii
+          (Get-FileHash -Algorithm SHA256 -LiteralPath $cipherPath).Hash.ToLowerInvariant() | Set-Content -LiteralPath (Join-Path $sealed 'evidence.cipher.sha256') -Encoding ascii
+          @(
+            'FORMAT=ZDB-AES-256-CBC-PKCS7-V1',
+            'SDK=${{ matrix.sdk }}',
+            'EXPECTED_RUNTIME=${{ matrix.runtime }}',
+            'PACKAGE=${{ matrix.package }}',
+            'RUN_ID=${{ github.run_id }}',
+            'SOURCE_SHA=${{ github.sha }}'
+          ) | Set-Content -LiteralPath (Join-Path $sealed 'metadata.txt') -Encoding ascii
+
+          Remove-Item -LiteralPath $zipPath,$keyPath -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath (Join-Path $workRoot 'payload') -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath (Join-Path $workRoot 'payload.zip') -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $evidence -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "SEALED_EVIDENCE=PASS LABEL=${{ matrix.label }}"
+
+      - name: Upload sealed evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sealed-current-ga-${{ matrix.label }}
+          path: sealed-evidence-${{ matrix.label }}
+          if-no-files-found: error
+          retention-days: 3

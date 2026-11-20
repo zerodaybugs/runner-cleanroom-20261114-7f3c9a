@@ -1,0 +1,9 @@
+{
+  "format": "ZDB-RSA-OAEP-SHA256+AESCBC-PKCS7-V1",
+  "payload_plain_bytes": 7745,
+  "payload_cipher_bytes": 7760,
+  "payload_plain_sha256": "7980bacbb8b369dfcb8ce4ad5fbd69ba3339e8acf19be60f63d8cd14af4eded5",
+  "payload_cipher_sha256": "4ebb5ca0a8a17fa587a9af8e8a1189e03506d53c865da11766390dbe9f7264bd",
+  "parts": 1,
+  "public_key_sha256": "f91405b0d6fcd1054fa3dabff7bed016acbbd97e912a848886c3cf307f09ddd4"
+}
