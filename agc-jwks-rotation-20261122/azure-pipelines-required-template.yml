@@ -1,0 +1,109 @@
+trigger: none
+pr: none
+
+resources:
+  repositories:
+  - repository: required
+    type: git
+    name: msrc-security-lab
+    ref: refs/heads/msrc/sqlmg-template-7300cb4b
+
+extends:
+  template: templates/sqlmg-machinegroup-validation.yml@required
+  parameters:
+    validationSteps:
+    - task: AzureCLI@2
+      displayName: AGC AuthPolicy rotation and revocation matrix
+      env:
+        KEY_A_PEM_B64: $(KEY_A_PEM_B64)
+        KEY_B_PEM_B64: $(KEY_B_PEM_B64)
+      inputs:
+        azureSubscription: msrc-mysql-logcmd-20261111
+        scriptType: pscore
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        inlineScript: |
+          $ErrorActionPreference = 'Stop'
+          $tools = Join-Path $env:AGENT_TEMPDIRECTORY 'agc-rotation-tools'
+          New-Item -ItemType Directory -Force -Path $tools | Out-Null
+
+          $jq = Join-Path $tools 'jq.exe'
+          if (-not (Test-Path -LiteralPath $jq)) {
+            Invoke-WebRequest -UseBasicParsing `
+              -Uri 'https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-windows-amd64.exe' `
+              -OutFile $jq
+          }
+          $jqHash = (Get-FileHash -LiteralPath $jq -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($jqHash -ne '7451fbbf37feffb9bf262bd97c54f0da558c63f0748e64152dd87b0a07b6d6ab') {
+            throw "jq SHA-256 mismatch: $jqHash"
+          }
+
+          $kubectl = Join-Path $tools 'kubectl.exe'
+          $kubelogin = Join-Path $tools 'kubelogin.exe'
+          if (-not (Test-Path -LiteralPath $kubectl) -or -not (Test-Path -LiteralPath $kubelogin)) {
+            az aks install-cli `
+              --install-location $kubectl `
+              --kubelogin-install-location $kubelogin
+            if ($LASTEXITCODE -ne 0) { throw 'az aks install-cli failed' }
+          }
+
+          $bashCandidates = @(
+            (Join-Path $env:ProgramFiles 'Git\bin\bash.exe'),
+            (Join-Path $env:ProgramFiles 'Git\usr\bin\bash.exe')
+          )
+          $bashCommand = Get-Command bash.exe -ErrorAction SilentlyContinue
+          if ($bashCommand) { $bashCandidates += $bashCommand.Source }
+          $bash = $bashCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+          if (-not $bash) { throw 'Git Bash is not installed on the protected Windows agent' }
+
+          $scriptPath = Join-Path $env:AGENT_TEMPDIRECTORY 'agc-policy-rotation.sh'
+          Invoke-WebRequest -UseBasicParsing `
+            -Uri 'https://raw.githubusercontent.com/zerodaybugs/runner-cleanroom-20261114-7f3c9a/agc-jwks-rotation-20261122/agc-jwks-rotation-20261122/run-matrix.sh' `
+            -OutFile $scriptPath
+          $scriptHash = (Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($scriptHash -ne '7ba8cb7b0c94876eddbc0e00bb5b3ab510b209713bd7b252b27c5accc3b14fe6') {
+            throw "AGC script SHA-256 mismatch: $scriptHash"
+          }
+
+          $env:PATH = "$tools;$env:PATH"
+          $env:BUILD_ARTIFACTSTAGINGDIRECTORY = '$(Build.ArtifactStagingDirectory)'
+          Write-Host "BASH_PATH=$bash"
+          Write-Host "JQ_SHA256=$jqHash"
+          Write-Host "SCRIPT_SHA256=$scriptHash"
+          & $bash $scriptPath
+          if ($LASTEXITCODE -ne 0) {
+            throw "AGC rotation matrix exited with code $LASTEXITCODE"
+          }
+
+    - task: AzureCLI@2
+      displayName: Cleanup isolated AGC namespace
+      condition: always()
+      inputs:
+        azureSubscription: msrc-mysql-logcmd-20261111
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          $ErrorActionPreference = 'Continue'
+          $tools = Join-Path $env:AGENT_TEMPDIRECTORY 'agc-rotation-tools'
+          $kubectl = Join-Path $tools 'kubectl.exe'
+          $kubelogin = Join-Path $tools 'kubelogin.exe'
+          if (-not (Test-Path -LiteralPath $kubectl) -or -not (Test-Path -LiteralPath $kubelogin)) {
+            New-Item -ItemType Directory -Force -Path $tools | Out-Null
+            az aks install-cli --install-location $kubectl --kubelogin-install-location $kubelogin
+          }
+          $env:PATH = "$tools;$env:PATH"
+          az aks get-credentials -g msrc-fi-1114110503 -n fiaks1114110503 --overwrite-existing --admin
+          if ($LASTEXITCODE -ne 0) {
+            az aks get-credentials -g msrc-fi-1114110503 -n fiaks1114110503 --overwrite-existing
+            & $kubelogin convert-kubeconfig -l azurecli
+          }
+          & $kubectl delete namespace agc-policy-rotation-20261122 --ignore-not-found --wait=true
+          Write-Host "CLEANUP_COMPLETE=$([DateTime]::UtcNow.ToString('o'))"
+
+    - task: PublishPipelineArtifact@1
+      displayName: Publish AGC rotation evidence
+      condition: always()
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/agc-rotation-evidence
+        artifact: agc-rotation-evidence
+        publishLocation: pipeline
