@@ -1,0 +1,178 @@
+name: Sanitized Aspire CVE-2026-120006 macOS harness diagnostics 20261124
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/_temporary-aspire-cve120006-macos-safe-diag-20261124.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-macos-safe-diag:
+    runs-on: macos-15
+    timeout-minutes: 110
+
+    steps:
+      - name: Checkout encrypted clean-room inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install exact .NET SDK lanes
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: |
+            10.0.404
+            11.0.100
+          cache: false
+
+      - name: Install exact software-virtualized container runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install docker qemu colima
+          colima start --vm-type qemu --arch aarch64 --cpu 2 --memory 4 --disk 20 --runtime docker
+          colima status
+          docker version
+
+      - name: Decrypt private harness and emit sanitized failure metadata
+        id: diagnose
+        continue-on-error: true
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          DOTNET_NOLOGO: '1'
+          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+          DOTNET_MULTILEVEL_LOOKUP: '0'
+        run: |
+          set -euo pipefail
+          test -n "$WRAPPING_KEY_B64"
+          mkdir -p safe-diagnostic
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+          source = Path('.github/workflows/_temporary-aspire-cve120006-macos-encrypted-20261124.yml').read_text()
+          def extract(start, end, output):
+              part = source.split(start, 1)[1].split(end, 1)[0]
+              Path(output).write_text(textwrap.dedent(part).strip() + '\n')
+          extract("cat > payload.key.enc.b64 <<'EOF_KEY'", 'EOF_KEY', 'payload.key.enc.b64')
+          extract("cat > payload.cipher.b64 <<'EOF_CIPHER'", 'EOF_CIPHER', 'payload.cipher.b64')
+          PY
+
+          printf '%s' "$WRAPPING_KEY_B64" | openssl base64 -d -A > wrapping.key
+          test "$(wc -c < wrapping.key | tr -d ' ')" = "32"
+          WRAP_KEY_HEX="$(xxd -p -c 256 wrapping.key)"
+          openssl enc -d -aes-256-cbc -K "$WRAP_KEY_HEX" -iv "$(tr -d '\r\n ' < bootstrap/private.iv.hex)" -in bootstrap/private.pem.enc -out private.pem
+
+          openssl base64 -d -A -in payload.key.enc.b64 -out payload.key.enc
+          openssl pkeyutl -decrypt -inkey private.pem -in payload.key.enc -out aspire120006.runtime.key -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          test "$(wc -c < aspire120006.runtime.key | tr -d ' ')" = "32"
+
+          openssl base64 -d -A -in payload.cipher.b64 -out payload.cipher
+          test "$(shasum -a 256 payload.cipher | awk '{print $1}')" = "f8fbf8ab46da85de8e2b6f74bb0541402fcc54fb85d559155f195eb80e0b8cf1"
+          KEY_HEX="$(xxd -p -c 256 aspire120006.runtime.key)"
+          openssl enc -d -aes-256-cbc -K "$KEY_HEX" -iv "39697e23f79ac921a0c4b30b90123c68" -in payload.cipher -out aspire120006.payload.zip
+          test "$(shasum -a 256 aspire120006.payload.zip | awk '{print $1}')" = "d75d38fffb514f4b9ed338014540d17cb8fb8ddf7576472a8d28c536e0fcb870"
+
+          mkdir -p private-payload
+          ditto -x -k aspire120006.payload.zip private-payload
+          SCRIPT=private-payload/zdb-aspire-macos/run.sh
+          chmod +x "$SCRIPT"
+
+          set +e
+          bash -n "$SCRIPT"
+          SYNTAX_RC=$?
+          export PS4='+ZDBTRACE:${LINENO}:${FUNCNAME[0]:-main}:'
+          BASH_XTRACEFD=7 bash -x "$SCRIPT" 7>safe-diagnostic/private.trace 2>safe-diagnostic/private.stderr
+          MATRIX_RC=$?
+          set -e
+
+          SCRIPT="$SCRIPT" SYNTAX_RC="$SYNTAX_RC" MATRIX_RC="$MATRIX_RC" python3 - <<'PY'
+          import hashlib, os, re, shlex
+          from pathlib import Path
+
+          script = Path(os.environ['SCRIPT'])
+          trace = Path('safe-diagnostic/private.trace').read_text(errors='replace').splitlines()
+          stderr = Path('safe-diagnostic/private.stderr').read_text(errors='replace')
+
+          parsed = []
+          rx = re.compile(r'^\+ZDBTRACE:(\d+):([^:]*):(.*)$')
+          for line in trace:
+              m = rx.match(line)
+              if not m:
+                  continue
+              lineno, func, body = m.groups()
+              try:
+                  tokens = shlex.split(body, posix=True)
+              except Exception:
+                  tokens = body.strip().split()
+              command = 'unknown'
+              for token in tokens:
+                  if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', token):
+                      continue
+                  command = os.path.basename(token)
+                  break
+              command = re.sub(r'[^A-Za-z0-9_.+-]', '_', command)[:80]
+              parsed.append((int(lineno), re.sub(r'[^A-Za-z0-9_.+-]', '_', func)[:80], command))
+
+          low = stderr.lower()
+          classes = [
+              ('COMMAND_NOT_FOUND', ['command not found']),
+              ('NO_SUCH_FILE', ['no such file or directory']),
+              ('PERMISSION_DENIED', ['permission denied']),
+              ('UNBOUND_VARIABLE', ['unbound variable']),
+              ('SYNTAX_ERROR', ['syntax error']),
+              ('CONNECTION_FAILURE', ['connection refused', 'could not connect', 'failed to connect']),
+              ('TIMEOUT', ['timed out', 'timeout']),
+              ('ASSERTION_OR_TEST_FAILED', ['assert', 'expected', 'test failed']),
+          ]
+          error_class = 'OTHER_NONZERO'
+          for name, needles in classes:
+              if any(n in low for n in needles):
+                  error_class = name
+                  break
+
+          tail = parsed[-8:]
+          last = tail[-1] if tail else (0, 'none', 'none')
+          data = script.read_bytes()
+          lines = [
+              'FORMAT=ZDB_SAFE_DIAGNOSTIC_V1',
+              f'SCRIPT_SHA256={hashlib.sha256(data).hexdigest()}',
+              f'SCRIPT_BYTES={len(data)}',
+              f'SCRIPT_LINES={data.count(chr(10).encode())}',
+              f'BASH_SYNTAX_RC={os.environ["SYNTAX_RC"]}',
+              f'MATRIX_RC={os.environ["MATRIX_RC"]}',
+              f'FAIL_LINE={last[0]}',
+              f'FAIL_FUNCTION={last[1]}',
+              f'FAIL_COMMAND={last[2]}',
+              f'STDERR_CLASS={error_class}',
+              'TRACE_TAIL=' + ','.join(f'{n}:{f}:{c}' for n, f, c in tail),
+          ]
+          Path('safe-diagnostic/diagnostic.txt').write_text('\n'.join(lines) + '\n')
+          PY
+
+          cat safe-diagnostic/diagnostic.txt
+          rm -f safe-diagnostic/private.trace safe-diagnostic/private.stderr
+          rm -rf private-payload aspire120006.payload.zip payload.cipher payload.cipher.b64 payload.key.enc payload.key.enc.b64 private.pem wrapping.key aspire120006.runtime.key
+          exit "$MATRIX_RC"
+
+      - name: Upload sanitized diagnostic
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aspire-cve120006-macos-safe-diagnostic-${{ github.sha }}
+          path: safe-diagnostic/diagnostic.txt
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Preserve diagnostic failure status
+        if: always()
+        shell: bash
+        run: |
+          if [[ '${{ steps.diagnose.outcome }}' != 'success' ]]; then
+            echo 'Harness failed; sanitized diagnostic was emitted.'
+            exit 1
+          fi
