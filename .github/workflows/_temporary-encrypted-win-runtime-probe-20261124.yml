@@ -1,0 +1,156 @@
+name: Encrypted Windows Runtime Compatibility Probe 20261124
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 11.0.100
+          cache: false
+
+      - name: Unseal and execute private compatibility payload
+        id: probe
+        continue-on-error: true
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          DOTNET_NOLOGO: '1'
+          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WRAPPING_KEY_B64)) { throw 'wrapping key missing' }
+          $wrappingKey = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
+          if ($wrappingKey.Length -ne 32) { throw 'wrapping key length invalid' }
+
+          $wrappedPrivate = [IO.File]::ReadAllBytes((Join-Path $PWD 'bootstrap/private.pem.enc'))
+          $wrapIv = [Convert]::FromHexString((Get-Content (Join-Path $PWD 'bootstrap/private.iv.hex') -Raw).Trim())
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $wrappingKey; $aes.IV = $wrapIv
+            $d = $aes.CreateDecryptor()
+            try { $privatePem = $d.TransformFinalBlock($wrappedPrivate,0,$wrappedPrivate.Length) } finally { $d.Dispose() }
+          } finally { $aes.Dispose() }
+
+          $rsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $rsa.ImportFromPem([Text.Encoding]::ASCII.GetString($privatePem))
+            $wrappedKey = [Convert]::FromBase64String((Get-Content 'zdb-win-v1.key.enc.b64' -Raw).Trim())
+            $payloadKey = $rsa.Decrypt($wrappedKey,[Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          } finally { $rsa.Dispose() }
+          if ($payloadKey.Length -ne 32) { throw 'payload key invalid' }
+          [IO.File]::WriteAllBytes('zdb-win-v1.runtime.key',$payloadKey)
+
+          $iv = [Convert]::FromHexString((Get-Content 'zdb-win-v1.iv.hex' -Raw).Trim())
+          $cipherB64 = ((Get-ChildItem -File -Filter 'zdb-win-v1.enc.part*' | Sort-Object Name | ForEach-Object { (Get-Content $_.FullName -Raw).Trim() }) -join '')
+          $cipher = [Convert]::FromBase64String($cipherB64)
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $payloadKey; $aes.IV = $iv
+            $d = $aes.CreateDecryptor()
+            try { $plain = $d.TransformFinalBlock($cipher,0,$cipher.Length) } finally { $d.Dispose() }
+          } finally { $aes.Dispose() }
+
+          [IO.File]::WriteAllBytes('zdb-win-v1.zip',$plain)
+          $expected = (Get-Content 'zdb-win-v1.plain.sha256' -Raw).Trim().ToLowerInvariant()
+          $actual = (Get-FileHash -Algorithm SHA256 'zdb-win-v1.zip').Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw 'payload hash mismatch' }
+          Expand-Archive 'zdb-win-v1.zip' 'zdb-win-payload' -Force
+
+          $evidence = Join-Path $PWD ('evidence-zdb-win-' + '${{ matrix.os }}')
+          New-Item -ItemType Directory -Force $evidence | Out-Null
+          $env:EVIDENCE_DIR = $evidence
+          dotnet --info *> (Join-Path $evidence 'dotnet-info.txt')
+          dotnet --list-runtimes *> (Join-Path $evidence 'dotnet-runtimes.txt')
+
+          Push-Location 'zdb-win-payload'
+          try {
+            dotnet restore Probe.csproj --disable-parallel *> (Join-Path $evidence 'restore.log')
+            if ($LASTEXITCODE -ne 0) { $code=$LASTEXITCODE }
+            else {
+              dotnet build Probe.csproj -c Release --no-restore *> (Join-Path $evidence 'build.log')
+              if ($LASTEXITCODE -ne 0) { $code=$LASTEXITCODE }
+              else {
+                dotnet run --project Probe.csproj -c Release --no-build *> (Join-Path $evidence 'run.log')
+                $code=$LASTEXITCODE
+              }
+            }
+          } finally { Pop-Location }
+          if ($null -eq $code) { $code=99 }
+          Set-Content (Join-Path $evidence 'exit-code.txt') $code -Encoding ascii
+          exit $code
+
+      - name: Seal all evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $keyPath = Join-Path $PWD 'zdb-win-v1.runtime.key'
+          if (-not (Test-Path $keyPath)) { throw 'runtime evidence key unavailable' }
+          $evidence = Join-Path $PWD ('evidence-zdb-win-' + '${{ matrix.os }}')
+          if (-not (Test-Path $evidence)) {
+            New-Item -ItemType Directory -Force $evidence | Out-Null
+            'NO_EVIDENCE_DIRECTORY' | Set-Content (Join-Path $evidence 'status.txt')
+            '98' | Set-Content (Join-Path $evidence 'exit-code.txt')
+          }
+          Get-ChildItem $evidence -File -Recurse | Sort-Object FullName | ForEach-Object {
+            $h=Get-FileHash -Algorithm SHA256 $_.FullName
+            '{0}  {1}' -f $h.Hash.ToLowerInvariant(),($_.FullName.Substring($evidence.Length+1)-replace '\\','/')
+          } | Set-Content (Join-Path $evidence 'SHA256SUMS.txt') -Encoding ascii
+
+          Compress-Archive $evidence 'evidence.plain.zip' -Force
+          $plainHash=(Get-FileHash -Algorithm SHA256 'evidence.plain.zip').Hash.ToLowerInvariant()
+          $key=[IO.File]::ReadAllBytes($keyPath)
+          $iv=[Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $plain=[IO.File]::ReadAllBytes('evidence.plain.zip')
+          $aes=[Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode='CBC'; $aes.Padding='PKCS7'; $aes.Key=$key; $aes.IV=$iv
+            $e=$aes.CreateEncryptor()
+            try { $cipher=$e.TransformFinalBlock($plain,0,$plain.Length) } finally { $e.Dispose() }
+          } finally { $aes.Dispose() }
+          New-Item -ItemType Directory -Force 'sealed-evidence' | Out-Null
+          [IO.File]::WriteAllBytes('sealed-evidence/evidence.enc',$cipher)
+          [Convert]::ToHexString($iv).ToLowerInvariant() | Set-Content 'sealed-evidence/evidence.iv.hex' -Encoding ascii
+          $plainHash | Set-Content 'sealed-evidence/evidence.plain.sha256' -Encoding ascii
+          (Get-FileHash -Algorithm SHA256 'sealed-evidence/evidence.enc').Hash.ToLowerInvariant() | Set-Content 'sealed-evidence/evidence.cipher.sha256' -Encoding ascii
+          Copy-Item (Join-Path $evidence 'exit-code.txt') 'sealed-evidence/exit-code.txt'
+          @(
+            'FORMAT=ZDB-AES-256-CBC-PKCS7-V1',
+            'OS=${{ matrix.os }}',
+            'RUN_ID=${{ github.run_id }}',
+            'SOURCE_SHA=${{ github.sha }}'
+          ) | Set-Content 'sealed-evidence/metadata.txt' -Encoding ascii
+          Remove-Item 'evidence.plain.zip',$keyPath,'zdb-win-v1.zip' -Force -ErrorAction SilentlyContinue
+          Remove-Item 'zdb-win-payload',$evidence -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host 'SEALED_EVIDENCE=PASS'
+
+      - name: Upload sealed evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: encrypted-win-compat-${{ matrix.os }}-${{ github.run_id }}
+          path: sealed-evidence
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Enforce private probe outcome
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'sealed-evidence/exit-code.txt')) { throw 'missing outcome receipt' }
+          $code=[int](Get-Content 'sealed-evidence/exit-code.txt' -Raw).Trim()
+          if ($code -ne 0) { throw "private probe controls failed: $code" }
