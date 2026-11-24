@@ -1,0 +1,37 @@
+name: Aspire macOS container capability gate 20261124
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/aspire-macos-container-capability-20261124.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capability:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: macOS virtualization and container capability gate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sw_vers
+          uname -a
+          echo "ARCH=$(uname -m)"
+          echo "HV_SUPPORT=$(sysctl -n kern.hv_support 2>/dev/null || true)"
+          echo "DOCKER=$(command -v docker || true)"
+          docker version || true
+          echo "COLIMA=$(command -v colima || true)"
+          colima version || true
+          echo "LIMACTL=$(command -v limactl || true)"
+          limactl --version || true
+          echo "QEMU=$(command -v qemu-system-aarch64 || command -v qemu-system-x86_64 || true)"
+          brew --version
+          brew list --versions docker colima lima qemu 2>/dev/null || true
+          system_profiler SPHardwareDataType | sed -n '1,100p'
