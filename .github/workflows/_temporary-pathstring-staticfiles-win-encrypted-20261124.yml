@@ -1,0 +1,186 @@
+name: Temporary Encrypted PathString StaticFiles Windows Probe 20261124
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/_temporary-pathstring-staticfiles-win-encrypted-20261124.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-ga-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-2022
+          - windows-2025
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout encrypted clean-room inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install exact .NET 11.0.100 SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 11.0.100
+          cache: false
+
+      - name: Unwrap and execute private PathString probe
+        id: execute
+        continue-on-error: true
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          DOTNET_NOLOGO: '1'
+          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+          DOTNET_ROLL_FORWARD: Disable
+          DOTNET_MULTILEVEL_LOOKUP: '0'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WRAPPING_KEY_B64)) { throw 'wrapping key missing' }
+
+          $wrappingKey = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
+          if ($wrappingKey.Length -ne 32) { throw 'wrapping key length invalid' }
+          $wrappedPrivate = [IO.File]::ReadAllBytes((Join-Path $PWD 'bootstrap/private.pem.enc'))
+          $wrapIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'bootstrap/private.iv.hex') -Raw).Trim())
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $wrappingKey
+            $aes.IV = $wrapIv
+            $decryptor = $aes.CreateDecryptor()
+            try {
+              $privatePemBytes = $decryptor.TransformFinalBlock($wrappedPrivate, 0, $wrappedPrivate.Length)
+            } finally {
+              $decryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+
+          $rsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $rsa.ImportFromPem([Text.Encoding]::ASCII.GetString($privatePemBytes))
+            $wrappedPayloadKey = [Convert]::FromBase64String((Get-Content -LiteralPath (Join-Path $PWD 'payloads/pathstring-staticfiles-win-v1.key.enc.b64') -Raw).Trim())
+            $payloadKey = $rsa.Decrypt($wrappedPayloadKey, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          } finally {
+            $rsa.Dispose()
+          }
+          if ($payloadKey.Length -ne 32) { throw 'payload key length invalid' }
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'pathstring-staticfiles.runtime.key'), $payloadKey)
+
+          $payloadIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'payloads/pathstring-staticfiles-win-v1.iv.hex') -Raw).Trim())
+          $payloadCipherB64 = ((Get-ChildItem -LiteralPath (Join-Path $PWD 'payloads') -File -Filter 'pathstring-staticfiles-win-v1.enc.part*' | Sort-Object Name | ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw).Trim() }) -join '')
+          if ([string]::IsNullOrWhiteSpace($payloadCipherB64)) { throw 'payload ciphertext parts missing' }
+          $payloadCipher = [Convert]::FromBase64String($payloadCipherB64)
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $payloadIv
+            $decryptor = $aes.CreateDecryptor()
+            try {
+              $payloadPlain = $decryptor.TransformFinalBlock($payloadCipher, 0, $payloadCipher.Length)
+            } finally {
+              $decryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+
+          $payloadZip = Join-Path $PWD 'pathstring-staticfiles.payload.zip'
+          [IO.File]::WriteAllBytes($payloadZip, $payloadPlain)
+          $expectedHash = (Get-Content -LiteralPath (Join-Path $PWD 'payloads/pathstring-staticfiles-win-v1.plain.sha256') -Raw).Trim().ToLowerInvariant()
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadZip).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) { throw "payload hash mismatch: $actualHash" }
+
+          $payloadDir = Join-Path $PWD 'pathstring-staticfiles-payload'
+          Expand-Archive -LiteralPath $payloadZip -DestinationPath $payloadDir -Force
+          & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $payloadDir 'zdb-pathstring-win-payload/run.ps1')
+          if ($LASTEXITCODE -ne 0) { throw "probe failed: $LASTEXITCODE" }
+
+      - name: Seal PathString evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $keyPath = Join-Path $PWD 'pathstring-staticfiles.runtime.key'
+          $dirs = @(Get-ChildItem -LiteralPath $PWD -Directory -Filter 'evidence-pathstring-staticfiles*')
+          if ($dirs.Count -eq 0) {
+            $fallback = Join-Path $PWD 'evidence-pathstring-staticfiles-fallback'
+            New-Item -ItemType Directory -Force -Path $fallback | Out-Null
+            'NO_EVIDENCE_DIRECTORY' | Set-Content (Join-Path $fallback 'status.txt')
+            $dirs = @((Get-Item -LiteralPath $fallback))
+          }
+          if (-not (Test-Path -LiteralPath $keyPath)) { throw 'payload evidence key unavailable' }
+
+          $zipPath = Join-Path $PWD 'pathstring-evidence.plain.zip'
+          Compress-Archive -Path $dirs.FullName -DestinationPath $zipPath -Force
+          $plainHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
+          $payloadKey = [IO.File]::ReadAllBytes($keyPath)
+          $evidenceIv = [Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $plain = [IO.File]::ReadAllBytes($zipPath)
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $evidenceIv
+            $encryptor = $aes.CreateEncryptor()
+            try {
+              $cipher = $encryptor.TransformFinalBlock($plain, 0, $plain.Length)
+            } finally {
+              $encryptor.Dispose()
+            }
+          } finally {
+            $aes.Dispose()
+          }
+
+          $sealed = Join-Path $PWD 'sealed-evidence'
+          New-Item -ItemType Directory -Force -Path $sealed | Out-Null
+          $cipherPath = Join-Path $sealed 'evidence.enc'
+          [IO.File]::WriteAllBytes($cipherPath, $cipher)
+          [Convert]::ToHexString($evidenceIv).ToLowerInvariant() | Set-Content (Join-Path $sealed 'evidence.iv.hex') -Encoding ascii
+          $plainHash | Set-Content (Join-Path $sealed 'evidence.plain.sha256') -Encoding ascii
+          (Get-FileHash -Algorithm SHA256 -LiteralPath $cipherPath).Hash.ToLowerInvariant() | Set-Content (Join-Path $sealed 'evidence.cipher.sha256') -Encoding ascii
+          @(
+            'FORMAT=ZDB-AES-256-CBC-PKCS7-V1',
+            'TARGET=.NET 11.0.0 exact-GA Windows PathString-to-StaticFiles differential',
+            'RUNNER=${{ matrix.os }}',
+            'RUN_ID=${{ github.run_id }}',
+            'SOURCE_SHA=${{ github.sha }}',
+            'EXECUTE_OUTCOME=${{ steps.execute.outcome }}'
+          ) | Set-Content (Join-Path $sealed 'metadata.txt') -Encoding ascii
+
+          Remove-Item -LiteralPath $zipPath,$keyPath,(Join-Path $PWD 'pathstring-staticfiles.payload.zip') -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath (Join-Path $PWD 'pathstring-staticfiles-payload') -Recurse -Force -ErrorAction SilentlyContinue
+          foreach ($dir in $dirs) { Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+
+      - name: Upload sealed evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pathstring-staticfiles-${{ matrix.os }}-${{ github.sha }}
+          path: sealed-evidence
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Enforce probe result
+        if: always()
+        shell: pwsh
+        run: |
+          if ('${{ steps.execute.outcome }}' -ne 'success') {
+            throw 'The exact-GA probe did not satisfy all positive and negative controls; inspect sealed evidence.'
+          }
