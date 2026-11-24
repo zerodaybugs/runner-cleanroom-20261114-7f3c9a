@@ -1,0 +1,236 @@
+name: Encrypted Aspire CVE-2026-120006 macOS residual matrix 20261124
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/_temporary-aspire-cve120006-macos-encrypted-20261124.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-macos:
+    runs-on: macos-15
+    timeout-minutes: 110
+
+    steps:
+      - name: Checkout encrypted clean-room inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install exact .NET SDK lanes
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: |
+            10.0.404
+            11.0.100
+          cache: false
+
+      - name: Install software-virtualized container runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install docker qemu colima
+          colima start --vm-type qemu --arch aarch64 --cpu 2 --memory 4 --disk 20 --runtime docker
+          colima status
+          docker version
+
+      - name: Unwrap and execute private Aspire matrix
+        id: execute
+        continue-on-error: true
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          DOTNET_NOLOGO: '1'
+          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+          DOTNET_MULTILEVEL_LOOKUP: '0'
+        run: |
+          set -euo pipefail
+          test -n "$WRAPPING_KEY_B64"
+
+          printf '%s' "$WRAPPING_KEY_B64" | openssl base64 -d -A > wrapping.key
+          test "$(wc -c < wrapping.key | tr -d ' ')" = "32"
+          WRAP_KEY_HEX="$(xxd -p -c 256 wrapping.key)"
+          openssl enc -d -aes-256-cbc -K "$WRAP_KEY_HEX" -iv "$(tr -d '\r\n ' < bootstrap/private.iv.hex)" -in bootstrap/private.pem.enc -out private.pem
+
+          cat > payload.key.enc.b64 <<'EOF_KEY'
+          XPh7d++N/c8/y+y1BFj/F948eYFjOI7m+ue9DYOijFD6VwuVXgQlgBo5n4necyUoq4sVZvC+upBgGVwWoyL6C9HAoa0kP6mw2WvthSTtZwVdJw0k/JFetflXdIFMdsRvcenPVgfbMmV2+/jwYdxJ0C0jtigc2xAXgF58kusizose3/D2x7DgekBKnZZNxa+K//ZC1Fuetqn4WpJzOdkM5KVpbBmEAVysQZShjEN7Jy+Ok79henW7ZFwu6Df90A06x7i7sRfqw5qDECpjimtRRTmAZAnz7oEjU9M3DctnL5Q0YkhxMtakQVhgBXiO8aj9qlRvX5Hm1raWjCSmckC4IwaQF9BtRnPb3umuwf7pmlJrEJuiezIoPYEWmp06BP9ZAvYTEqxqDUdged8R3+LuO05DSlOU9DQE3zojwcit+P5YD68Fk611YkoHKozWCl1Y3O8rTEgwJ90wiJOxuaQDe7jQeZsXAYUICT7eKAfijX3cbyuknWSxHM1jZA1TsWtR
+          EOF_KEY
+          openssl base64 -d -A -in payload.key.enc.b64 -out payload.key.enc
+          openssl pkeyutl -decrypt -inkey private.pem -in payload.key.enc -out aspire120006.runtime.key -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          test "$(wc -c < aspire120006.runtime.key | tr -d ' ')" = "32"
+
+          cat > payload.cipher.b64 <<'EOF_CIPHER'
+          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
+          EOF_CIPHER
+          openssl base64 -d -A -in payload.cipher.b64 -out payload.cipher
+          test "$(shasum -a 256 payload.cipher | awk '{print $1}')" = "f8fbf8ab46da85de8e2b6f74bb0541402fcc54fb85d559155f195eb80e0b8cf1"
+
+          KEY_HEX="$(xxd -p -c 256 aspire120006.runtime.key)"
+          openssl enc -d -aes-256-cbc -K "$KEY_HEX" -iv "39697e23f79ac921a0c4b30b90123c68" -in payload.cipher -out aspire120006.payload.zip
+          test "$(shasum -a 256 aspire120006.payload.zip | awk '{print $1}')" = "d75d38fffb514f4b9ed338014540d17cb8fb8ddf7576472a8d28c536e0fcb870"
+
+          mkdir -p private-payload
+          ditto -x -k aspire120006.payload.zip private-payload
+          chmod +x private-payload/zdb-aspire-macos/run.sh
+          private-payload/zdb-aspire-macos/run.sh
+
+      - name: Seal Aspire evidence
+        if: always()
+        shell: bash
+        env:
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+        run: |
+          set -euo pipefail
+          test -f aspire120006.runtime.key
+
+          if [[ ! -d evidence-aspire120006-macos ]]; then
+            mkdir -p evidence-aspire120006-macos
+            printf 'NO_EVIDENCE_DIRECTORY\n' > evidence-aspire120006-macos/status.txt
+          fi
+
+          ditto -c -k --sequesterRsrc --keepParent evidence-aspire120006-macos evidence.plain.zip
+          PLAIN_SHA="$(shasum -a 256 evidence.plain.zip | awk '{print $1}')"
+          EVIDENCE_IV="$(openssl rand -hex 16)"
+          KEY_HEX="$(xxd -p -c 256 aspire120006.runtime.key)"
+          openssl enc -aes-256-cbc -K "$KEY_HEX" -iv "$EVIDENCE_IV" -in evidence.plain.zip -out evidence.enc
+
+          mkdir -p sealed-evidence
+          mv evidence.enc sealed-evidence/evidence.enc
+          printf '%s\n' "$EVIDENCE_IV" > sealed-evidence/evidence.iv.hex
+          printf '%s\n' "$PLAIN_SHA" > sealed-evidence/evidence.plain.sha256
+          shasum -a 256 sealed-evidence/evidence.enc | awk '{print $1}' > sealed-evidence/evidence.cipher.sha256
+          cat > sealed-evidence/metadata.txt <<EOF
+          FORMAT=ZDB-AES-256-CBC-PKCS7-V1
+          TARGET=Aspire CVE-2026-120006 first-patched/current legacy-mode macOS residual matrix
+          RUNNER=${{ runner.os }}-${{ runner.arch }}
+          RUN_ID=${{ github.run_id }}
+          SOURCE_SHA=${{ github.sha }}
+          EXECUTE_OUTCOME=$EXECUTE_OUTCOME
+          PAYLOAD_PLAIN_SHA256=d75d38fffb514f4b9ed338014540d17cb8fb8ddf7576472a8d28c536e0fcb870
+          PAYLOAD_CIPHER_SHA256=f8fbf8ab46da85de8e2b6f74bb0541402fcc54fb85d559155f195eb80e0b8cf1
+          EOF
+
+          rm -rf evidence.plain.zip evidence-aspire120006-macos private-payload aspire120006.payload.zip payload.cipher payload.cipher.b64 payload.key.enc payload.key.enc.b64 private.pem wrapping.key aspire120006.runtime.key
+
+      - name: Upload sealed Aspire evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aspire-cve120006-macos-residual-${{ github.sha }}
+          path: sealed-evidence
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Enforce matrix result
+        if: always()
+        shell: bash
+        run: |
+          if [[ '${{ steps.execute.outcome }}' != 'success' ]]; then
+            echo 'Encrypted Aspire matrix failed; inspect sealed evidence.'
+            exit 1
+          fi
