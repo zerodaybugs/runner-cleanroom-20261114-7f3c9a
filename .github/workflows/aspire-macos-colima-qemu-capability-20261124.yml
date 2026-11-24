@@ -1,0 +1,53 @@
+name: Aspire macOS Colima QEMU capability 20261124
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/aspire-macos-colima-qemu-capability-20261124.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capability:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install Docker CLI, QEMU and Colima
+        shell: bash
+        run: |
+          set -euxo pipefail
+          brew install docker qemu colima
+          docker --version
+          qemu-system-aarch64 --version
+          colima version
+      - name: Start software-virtualized container runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          colima start --vm-type qemu --arch aarch64 --cpu 2 --memory 3 --disk 15 --runtime docker
+          colima status
+          docker version
+          docker info
+      - name: Verify host aliases from a stock container
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 -m http.server 18081 --bind 0.0.0.0 >/tmp/outer-host-http.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; colima stop || true' EXIT
+          sleep 2
+          docker run --rm alpine:3.23 sh -euxc '
+            cat /etc/resolv.conf
+            cat /etc/hosts
+            getent hosts host.docker.internal || true
+            getent hosts host.lima.internal || true
+            for h in host.docker.internal host.lima.internal; do
+              echo "=== $h ==="
+              wget -S -O- --timeout=5 "http://$h:18081/" || true
+            done
+          '
