@@ -25,9 +25,11 @@ jobs:
         env:
           WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
           GH_TOKEN: ${{ github.token }}
+          REWRAP_PUBLIC_PEM_B64: 'LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUlJQm9qQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FZOEFNSUlCaWdLQ0FZRUFWclAxUEgrT1J5aWx4RW5RQi92WQp5eVJmWGNFc0ptSmpKV0M5bS9mWEE3a0o4djNmL1BLNGE0Vnpmc3RqaTR0N2RjVU9pZTRwbkp1akJEOEtNS3EKc094UG4vYkc4dzJ4bGh0Tjk4dUFGd2hmbHNwUjlZV0lKL2h4WjJNL1dyK1Z5R2hESmRQcVVaVjByM1dOUTBNeQpPeEFHWUpDQWdaNDF2cjRHWVBZZDgxTmdSeWgyUWRtUnppbUgySWowMzFqV1pEMGp1WnhPR25GT1UwMjQ1UlIwCnpyQlRON3NQYThXVXd3TnpmaEZPYzNveGcwWlhjZS84eDd2NUxCaUk3aWg5U0xLYnQzbkMxMWkxKzlqQTI1MwpObEg0bmlNWFlGSjRHNm9rRFlJOWU2NWdOb2Y0Y2VYMG5rNnJHZnJzdjlyMThUd3VZMjdGTE5Id2VFUms2Z0VvCitJOGswNUt1ZUt4TzVMWm1xRFlDUFZsc3ZYQkUxbVRSYXhTNkVDTkJjSmll eXNRWkpsT0RkNGNpdkoTwpSdEJweQp2dTM4MURqL0pwWFV1VzZGK3ptQ3pCMFdGblg0ZlA5RmlXL2xjSVlETGJvYk0zKyttamN1OTF4Q0FQTHVjdHllCmp hS0x1TDJtKzFCRVIzQTNFYWN6a3FsUUMzWGdndE1uekR6QVVCbGtWempKQWdNQkFBRT0KLS0tLS1FTkQgUFVCTElDIEtFWS0tLS0tCg=='
         run: |
           set -euo pipefail
           test -n "$WRAPPING_KEY_B64"
+          test -n "$REWRAP_PUBLIC_PEM_B64"
 
           printf '%s' "$WRAPPING_KEY_B64" | openssl base64 -d -A > wrapping.key
           test "$(wc -c < wrapping.key | tr -d ' ')" = "32"
@@ -52,19 +54,7 @@ jobs:
             -pkeyopt rsa_mgf1_md:sha256
           test "$(wc -c < matrix.runtime.key | tr -d ' ')" = "32"
 
-          cat > rewrap-public.pem <<'PUBLIC_KEY'
------BEGIN PUBLIC KEY-----
-MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAvZP1PH+ORyilxEnQB/vY
-yyRfXcEsJmJjJWC9m/fXA7kJ8v3f/PK4a4Vzfstji44k7DcUOie4pnJujBD8KMKq
-sOxPn/bG8w2xlhtN98uAFwhflspR9YWIJ/hxZ2M/Wr+VyGhDJdPqUZV0r3WNQ0My
-OxAGYJCAgZ41vr4GYPYd81NgRyh2QdmRzimH2Ij031jWZD0juZxOGnFOU0245RR0
-zrBTN7sPa8WUwwNzfhFOc3oxg0ZXce/8x7v5LBiI7ih9SLKbt3nC11i1+9+jA253
-NlH4niMXYFJ4G6okDYI9e65gNof4ceX0nk6rGfrsv9r18TwuY27FLNHweERk6gEo
-+I8k05KueKxO5LZmqDYCPVlsvXBE1mTRaxS6ECNBcJieysQZJlODd4civJT+Rbpy
-vu381Dj/JpXUuW6F+zmCzB0WFnX4fP9FiW/lcIYDLbobM3++mjcu91xCAPLuctye
-jaKLuL2m+1BER3A3EaczkqlQC3XggtMnzDzAUBlkVzjJAgMBAAE=
------END PUBLIC KEY-----
-PUBLIC_KEY
+          printf '%s' "$REWRAP_PUBLIC_PEM_B64" | openssl base64 -d -A > rewrap-public.pem
           test "$(sha256sum rewrap-public.pem | awk '{print $1}')" = "a35eeb714e6caa9a1061bfcf676934df7b4d5c2cb8f4149791c4a77d6085dd4a"
 
           openssl pkeyutl -encrypt \
@@ -94,13 +84,13 @@ PUBLIC_KEY
 
           mv matrix.runtime.key.rewrapped.enc rewrapped/
           cp rewrap-public.pem rewrapped/
-          cat > rewrapped/rewrap-metadata.txt <<EOF
-FORMAT=RSA-OAEP-SHA256
-ORIGINAL_ARTIFACT_ID=15050514545
-ORIGINAL_ARTIFACT_SHA256=f879e4d94c92446332a27cd97e770eae98e6badba81baf6578e882450ed240b4
-REWRAP_PUBLIC_KEY_SHA256=a35eeb714e6caa9a1061bfcf676934df7b4d5c2cb8f4149791c4a77d6085dd4a
-SOURCE_RUN_ID=45663528366
-EOF
+          printf '%s\n' \
+            'FORMAT=RSA-OAEP-SHA256' \
+            'ORIGINAL_ARTIFACT_ID=15050514545' \
+            'ORIGINAL_ARTIFACT_SHA256=f879e4d94c92446332a27cd97e770eae98e6badba81baf6578e882450ed240b4' \
+            'REWRAP_PUBLIC_KEY_SHA256=a35eeb714e6caa9a1061bfcf676934df7b4d5c2cb8f4149791c4a77d6085dd4a' \
+            'SOURCE_RUN_ID=45663528366' \
+            > rewrapped/rewrap-metadata.txt
 
           rm -f wrapping.key private.pem payload.key.enc matrix.runtime.key sealed-artifact.zip
 
