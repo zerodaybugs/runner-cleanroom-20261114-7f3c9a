@@ -80,6 +80,22 @@ try {
     Expand-Archive -LiteralPath $payloadZip -DestinationPath $payloadDir -Force
     $payloadRoot = Join-Path $payloadDir 'zdb-pathstring-staticfiles-final-v2'
     if (-not (Test-Path -LiteralPath (Join-Path $payloadRoot 'run.ps1'))) { throw 'payload root invalid' }
+
+    # Deterministic harness correction: a client-side TCP half-close caused Kestrel on Windows
+    # to abort otherwise complete HTTP/1.1 requests before producing any response. The
+    # submission source omits this line. Patch the sealed validation copy and bind it to the
+    # exact SHA-256 of the source included in the final package.
+    $programPath = Join-Path $payloadRoot 'Program.cs'
+    $programText = Get-Content -LiteralPath $programPath -Raw
+    $halfClose = '    client.Client.Shutdown(SocketShutdown.Send);'
+    if (-not $programText.Contains($halfClose)) { throw 'expected half-close anchor missing' }
+    $programText = $programText.Replace($halfClose + "`r`n", '').Replace($halfClose + "`n", '')
+    Set-Content -LiteralPath $programPath -Value $programText -NoNewline -Encoding utf8NoBOM
+    $programHash = (Get-FileHash -LiteralPath $programPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($programHash -ne 'a341765422f3bc05bda11c972ab35f07aa495bae96de1b1faed042af15c4148a') {
+        throw "patched Program.cs hash mismatch: $programHash"
+    }
+
     & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $payloadRoot 'run.ps1') -Lane $Lane -EvidenceDir $evidence
     if ($LASTEXITCODE -ne 0) { throw "final PoC failed: $LASTEXITCODE" }
     $executeOutcome = 'success'
