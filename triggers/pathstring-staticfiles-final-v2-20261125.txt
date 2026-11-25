@@ -1,5 +1,7 @@
-UTC=2026-11-25T13:05:00Z
+UTC=2026-11-25T13:18:00Z
 PURPOSE=final-minimized-submit-ready-pathstring-staticfiles-validation-v2
+RERUN=remove-client-tcp-half-close-and-bind-final-source-sha256
+PROGRAM_SHA256=a341765422f3bc05bda11c972ab35f07aa495bae96de1b1faed042af15c4148a
 SDK10=10.0.404
 RUNTIME10=10.0.15
 SDK11=11.0.100
