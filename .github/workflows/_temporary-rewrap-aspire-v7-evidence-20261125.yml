@@ -52,7 +52,20 @@ jobs:
             -pkeyopt rsa_padding_mode:oaep \
             -pkeyopt rsa_oaep_md:sha256 \
             -pkeyopt rsa_mgf1_md:sha256
-          test "$(wc -c < matrix.runtime.key | tr -d ' ')" = "32"
+          test "$(wc -c < matrix.runtime.key | tr -d ' ' )" = "32"
+
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v7-overlay.key.enc.b64 \
+            | openssl base64 -d -A > overlay.key.enc
+          test "$(sha256sum overlay.key.enc | awk '{print $1}')" = "5415782032ec1a54fe55c67ac9a88fea1947f7c1e265ec80a5079e4d83e8e28a"
+
+          openssl pkeyutl -decrypt \
+            -inkey private.pem \
+            -in overlay.key.enc \
+            -out overlay.runtime.key \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -pkeyopt rsa_mgf1_md:sha256
+          test "$(wc -c < overlay.runtime.key | tr -d ' ')" = "32"
 
           printf '%s' "$REWRAP_PUBLIC_PEM_B64" | openssl base64 -d -A > rewrap-public.pem
           test "$(sha256sum rewrap-public.pem | awk '{print $1}')" = "a35eeb714e6caa9a1061bfcf676934df7b4d5c2cb8f4149791c4a77d6085dd4a"
@@ -62,6 +75,15 @@ jobs:
             -inkey rewrap-public.pem \
             -in matrix.runtime.key \
             -out matrix.runtime.key.rewrapped.enc \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -pkeyopt rsa_mgf1_md:sha256
+
+          openssl pkeyutl -encrypt \
+            -pubin \
+            -inkey rewrap-public.pem \
+            -in overlay.runtime.key \
+            -out overlay.runtime.key.rewrapped.enc \
             -pkeyopt rsa_padding_mode:oaep \
             -pkeyopt rsa_oaep_md:sha256 \
             -pkeyopt rsa_mgf1_md:sha256
@@ -83,7 +105,10 @@ jobs:
           test "$(sha256sum rewrapped/evidence.enc | awk '{print $1}')" = "$(tr -d '\r\n ' < rewrapped/evidence.cipher.sha256)"
 
           mv matrix.runtime.key.rewrapped.enc rewrapped/
+          mv overlay.runtime.key.rewrapped.enc rewrapped/
           cp rewrap-public.pem rewrapped/
+          cp sealed/aspire-macos-matrix-v7-overlay.metadata rewrapped/
+          cp sealed/aspire-macos-matrix-v7-overlay.enc.b64.part-* rewrapped/
           printf '%s\n' \
             'FORMAT=RSA-OAEP-SHA256' \
             'ORIGINAL_ARTIFACT_ID=15050514545' \
@@ -92,12 +117,12 @@ jobs:
             'SOURCE_RUN_ID=45663528366' \
             > rewrapped/rewrap-metadata.txt
 
-          rm -f wrapping.key private.pem payload.key.enc matrix.runtime.key sealed-artifact.zip
+          rm -f wrapping.key private.pem payload.key.enc overlay.key.enc matrix.runtime.key overlay.runtime.key sealed-artifact.zip
 
       - name: Upload rewrapped sealed evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: aspire-v7-rewrapped-evidence-${{ github.sha }}
+          name: aspire-v7-rewrapped-evidence-and-overlay-${{ github.sha }}
           path: rewrapped
           if-no-files-found: error
           retention-days: 1
