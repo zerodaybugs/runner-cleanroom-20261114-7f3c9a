@@ -1,0 +1,240 @@
+name: Sealed Aspire CVE-2026-120006 macOS residual matrix v11 stock lifecycle
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-macos-matrix:
+    runs-on: macos-15
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout sealed clean-room inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install exact .NET SDK lanes
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: |
+            10.0.404
+            11.0.100
+          cache: false
+
+      - name: Install software-virtualized container runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install docker qemu colima
+          colima start --vm-type qemu --arch aarch64 --cpu 3 --memory 6 --disk 30 --runtime docker
+          colima status
+          docker version
+
+      - name: Unwrap and execute private first-patched/current matrix
+        id: execute
+        continue-on-error: true
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$WRAPPING_KEY_B64"
+
+          meta_get() {
+            awk -F= -v key="$1" '$1 == key { print substr($0, index($0, "=") + 1); exit }' sealed/aspire-macos-matrix-v10-selfcontained-overlay.metadata
+          }
+          patch_meta_get() {
+            awk -F= -v key="$1" '$1 == key { print substr($0, index($0, "=") + 1); exit }' sealed/aspire-v11-stock-lifecycle-patch.metadata
+          }
+
+          printf '%s' "$WRAPPING_KEY_B64" | openssl base64 -d -A > wrapping.key
+          test "$(wc -c < wrapping.key | tr -d ' ')" = "32"
+          WRAP_KEY_HEX="$(od -An -tx1 -v wrapping.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$WRAP_KEY_HEX" -iv "$(tr -d '\r\n ' < bootstrap/private.iv.hex)" -in bootstrap/private.pem.enc -out private.pem
+
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v2.key.enc.b64 | openssl base64 -d -A > payload.key.enc
+          test "$(shasum -a 256 payload.key.enc | awk '{print $1}')" = "be22571a034deff9daca1291cecadcdddfd98e79f49ee4e4cd548eb5bff2b2ad"
+          openssl pkeyutl -decrypt -inkey private.pem -in payload.key.enc -out matrix.runtime.key -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          test "$(wc -c < matrix.runtime.key | tr -d ' ')" = "32"
+          EVIDENCE_DIR=evidence-aspire120006-macos-v11-stock-lifecycle
+          mkdir -p "$EVIDENCE_DIR"
+
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v2.enc.b64 | openssl base64 -d -A > payload.enc
+          test "$(shasum -a 256 payload.enc | awk '{print $1}')" = "1d981b7a24d7f1d15d75782c658e122a87bab89e512f6dfa775d5827d0545f24"
+          KEY_HEX="$(od -An -tx1 -v matrix.runtime.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$KEY_HEX" -iv "206224599d55f53eba5616f78531addb" -in payload.enc -out payload.zip
+          test "$(shasum -a 256 payload.zip | awk '{print $1}')" = "ba640f7ae180b198351ff27f579158fabad7a7057261133bc5888dfe2e50a9f9"
+
+          mkdir -p private-payload
+          ditto -x -k payload.zip private-payload
+
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v10-selfcontained-overlay.enc.b64 > overlay.enc.b64.norm
+          test "$(shasum -a 256 overlay.enc.b64.norm | awk '{print $1}')" = "$(meta_get OVERLAY_B64_NORMALIZED_SHA256)"
+          openssl base64 -d -A -in overlay.enc.b64.norm -out overlay.enc
+          test "$(shasum -a 256 overlay.enc | awk '{print $1}')" = "$(meta_get OVERLAY_CIPHER_SHA256)"
+
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v10-selfcontained-overlay.key.enc.b64 | openssl base64 -d -A > overlay.key.enc
+          test "$(shasum -a 256 overlay.key.enc | awk '{print $1}')" = "$(meta_get OVERLAY_KEY_CIPHER_SHA256)"
+          openssl pkeyutl -decrypt -inkey private.pem -in overlay.key.enc -out overlay.runtime.key -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          test "$(wc -c < overlay.runtime.key | tr -d ' ')" = "32"
+
+          OVERLAY_KEY_HEX="$(od -An -tx1 -v overlay.runtime.key | tr -d ' \n')"
+          OVERLAY_IV_HEX="$(meta_get OVERLAY_IV_HEX)"
+          test "${#OVERLAY_IV_HEX}" = "32"
+          openssl enc -d -aes-256-cbc -K "$OVERLAY_KEY_HEX" -iv "$OVERLAY_IV_HEX" -in overlay.enc -out overlay.zip
+          test "$(shasum -a 256 overlay.zip | awk '{print $1}')" = "$(meta_get OVERLAY_PLAIN_SHA256)"
+          test "$(unzip -Z1 overlay.zip | sort | tr '\n' '|')" = "aspire-macos-matrix-v10-selfcontained/browser.js|aspire-macos-matrix-v10-selfcontained/run.sh|"
+
+          mkdir -p overlay
+          ditto -x -k overlay.zip overlay
+          test "$(shasum -a 256 overlay/aspire-macos-matrix-v10-selfcontained/run.sh | awk '{print $1}')" = "$(meta_get RUN_SH_SHA256)"
+          test "$(shasum -a 256 overlay/aspire-macos-matrix-v10-selfcontained/browser.js | awk '{print $1}')" = "$(meta_get BROWSER_JS_SHA256)"
+
+          tr -d '\r\n ' < sealed/aspire-v11-stock-lifecycle-patch.enc.b64 > patch.enc.b64.norm
+          test "$(shasum -a 256 patch.enc.b64.norm | awk '{print $1}')" = "$(patch_meta_get PATCH_B64_NORMALIZED_SHA256)"
+          openssl base64 -d -A -in patch.enc.b64.norm -out patch.enc
+          test "$(shasum -a 256 patch.enc | awk '{print $1}')" = "$(patch_meta_get PATCH_CIPHER_SHA256)"
+
+          tr -d '\r\n ' < sealed/aspire-v11-stock-lifecycle-patch.key.enc.b64 | openssl base64 -d -A > patch.key.enc
+          test "$(shasum -a 256 patch.key.enc | awk '{print $1}')" = "$(patch_meta_get PATCH_KEY_CIPHER_SHA256)"
+          openssl pkeyutl -decrypt -inkey private.pem -in patch.key.enc -out patch.runtime.key -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          test "$(wc -c < patch.runtime.key | tr -d ' ')" = "32"
+
+          PATCH_KEY_HEX="$(od -An -tx1 -v patch.runtime.key | tr -d ' \n')"
+          PATCH_IV_HEX="$(patch_meta_get PATCH_IV_HEX)"
+          test "${#PATCH_IV_HEX}" = "32"
+          openssl enc -d -aes-256-cbc -K "$PATCH_KEY_HEX" -iv "$PATCH_IV_HEX" -in patch.enc -out patch.zip
+          test "$(shasum -a 256 patch.zip | awk '{print $1}')" = "$(patch_meta_get PATCH_PLAIN_SHA256)"
+          test "$(unzip -Z1 patch.zip | sort | tr '\n' '|')" = "aspire-v11-stock-lifecycle-patch/patch.py|"
+          mkdir -p patch
+          ditto -x -k patch.zip patch
+          PATCH_SCRIPT=patch/aspire-v11-stock-lifecycle-patch/patch.py
+          test "$(shasum -a 256 "$PATCH_SCRIPT" | awk '{print $1}')" = "$(patch_meta_get PATCH_PY_SHA256)"
+
+          set +e
+          python3 "$PATCH_SCRIPT" overlay/aspire-macos-matrix-v10-selfcontained patched/aspire-macos-matrix-v11-stock-lifecycle > "$EVIDENCE_DIR/patch.stdout" 2> "$EVIDENCE_DIR/patch.stderr"
+          PATCH_RC=$?
+          set -e
+          printf 'PATCH_RC=%s\n' "$PATCH_RC" > "$EVIDENCE_DIR/patch-status.txt"
+          if [[ "$PATCH_RC" -ne 0 ]]; then
+            echo "matrix_rc=97" >> "$GITHUB_OUTPUT"
+            exit 97
+          fi
+
+          PATCHED_RUN=patched/aspire-macos-matrix-v11-stock-lifecycle/run.sh
+          PATCHED_BROWSER=patched/aspire-macos-matrix-v11-stock-lifecycle/browser.js
+          PATCH_MANIFEST=patched/aspire-macos-matrix-v11-stock-lifecycle/PATCH_MANIFEST.json
+          test -f "$PATCH_MANIFEST"
+          PATCHED_RUN_SHA="$(shasum -a 256 "$PATCHED_RUN" | awk '{print $1}')"
+          PATCHED_BROWSER_SHA="$(shasum -a 256 "$PATCHED_BROWSER" | awk '{print $1}')"
+          test "$PATCHED_RUN_SHA" = "$(patch_meta_get PATCHED_RUN_SHA256)"
+          test "$PATCHED_BROWSER_SHA" = "$(patch_meta_get PATCHED_BROWSER_SHA256)"
+          python3 - "$PATCH_MANIFEST" "$PATCHED_RUN_SHA" "$PATCHED_BROWSER_SHA" <<'PY_MANIFEST'
+import json,sys
+p,run_sha,browser_sha=sys.argv[1:]
+j=json.load(open(p))
+assert j['base_run_sha256']=='05e724c967e91f88a5c58e4a3966f70f683517c9861841894934d86f22fab1db'
+assert j['base_browser_sha256']=='d6be883d27624841150cdc3d9bddd953566cae2d2d41f46e6fe47c29e2cfe6d2'
+assert j['patched_run_sha256']==run_sha
+assert j['patched_browser_sha256']==browser_sha
+assert j['synthetic_privileged_command_removed'] is True
+assert j['sink']=='stock Aspire Dashboard Stop/Start lifecycle commands'
+PY_MANIFEST
+          bash -n "$PATCHED_RUN"
+          node --check "$PATCHED_BROWSER"
+          cp "$PATCH_MANIFEST" "$EVIDENCE_DIR/PATCH_MANIFEST.json"
+          printf '%s  run.sh\n%s  browser.js\n' "$PATCHED_RUN_SHA" "$PATCHED_BROWSER_SHA" > "$EVIDENCE_DIR/patched-hashes.txt"
+          echo "patched_run_sha=$PATCHED_RUN_SHA" >> "$GITHUB_OUTPUT"
+          echo "patched_browser_sha=$PATCHED_BROWSER_SHA" >> "$GITHUB_OUTPUT"
+
+          cp "$PATCHED_RUN" private-payload/aspire-macos-matrix-v2/run.sh
+          cp "$PATCHED_BROWSER" private-payload/aspire-macos-matrix-v2/browser.js
+          chmod 700 private-payload/aspire-macos-matrix-v2/run.sh
+
+          set +e
+          bash -x private-payload/aspire-macos-matrix-v2/run.sh > "$EVIDENCE_DIR/bootstrap-trace.log" 2>&1
+          MATRIX_RC=$?
+          set -e
+          printf 'MATRIX_RC=%s\n' "$MATRIX_RC" > "$EVIDENCE_DIR/bootstrap-status.txt"
+          echo "matrix_rc=$MATRIX_RC" >> "$GITHUB_OUTPUT"
+          exit "$MATRIX_RC"
+
+      - name: Emit metadata-only diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          echo '=== EXACT SDK/RUNTIME ==='
+          dotnet --info | sed -n '1,90p' || true
+          echo '=== ASPIRE.HOSTING OUTPUTS ==='
+          find zdb-matrix-work -type f -name 'Aspire.Hosting.dll' -print 2>/dev/null | sort || true
+          echo '=== LANE STATUS FILES ==='
+          find evidence-aspire120006-macos-v11-stock-lifecycle -maxdepth 2 -type f \( -name status.txt -o -name assertion.txt -o -name fix-dll.sha256 -o -name bootstrap-status.txt \) -print 2>/dev/null | sort || true
+
+      - name: Seal matrix evidence
+        if: always()
+        shell: bash
+        env:
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+        run: |
+          set -euo pipefail
+          test -f matrix.runtime.key
+          EVIDENCE_DIR=evidence-aspire120006-macos-v11-stock-lifecycle
+          if [[ ! -d "$EVIDENCE_DIR" ]]; then
+            mkdir -p "$EVIDENCE_DIR"
+            printf 'NO_EVIDENCE_DIRECTORY\n' > "$EVIDENCE_DIR/status.txt"
+          fi
+          printf 'EXECUTE_OUTCOME=%s\nMATRIX_RC=%s\n' "$EXECUTE_OUTCOME" "${{ steps.execute.outputs.matrix_rc }}" > "$EVIDENCE_DIR/workflow-status.txt"
+
+          ditto -c -k --sequesterRsrc --keepParent "$EVIDENCE_DIR" evidence.plain.zip
+          PLAIN_SHA="$(shasum -a 256 evidence.plain.zip | awk '{print $1}')"
+          EVIDENCE_IV="$(openssl rand -hex 16)"
+          KEY_HEX="$(od -An -tx1 -v matrix.runtime.key | tr -d ' \n')"
+          openssl enc -aes-256-cbc -K "$KEY_HEX" -iv "$EVIDENCE_IV" -in evidence.plain.zip -out evidence.enc
+
+          mkdir -p sealed-evidence
+          mv evidence.enc sealed-evidence/evidence.enc
+          printf '%s\n' "$EVIDENCE_IV" > sealed-evidence/evidence.iv.hex
+          printf '%s\n' "$PLAIN_SHA" > sealed-evidence/evidence.plain.sha256
+          shasum -a 256 sealed-evidence/evidence.enc | awk '{print $1}' > sealed-evidence/evidence.cipher.sha256
+          cat > sealed-evidence/metadata.txt <<EOF
+          FORMAT=ZDB-AES-256-CBC-PKCS7-V1
+          TARGET=Aspire CVE-2026-120006 first-patched/current macOS residual matrix v11 stock lifecycle
+          RUNNER=${{ runner.os }}-${{ runner.arch }}
+          RUN_ID=${{ github.run_id }}
+          SOURCE_SHA=${{ github.sha }}
+          EXECUTE_OUTCOME=$EXECUTE_OUTCOME
+          MATRIX_RC=${{ steps.execute.outputs.matrix_rc }}
+          PAYLOAD_PLAIN_SHA256=ba640f7ae180b198351ff27f579158fabad7a7057261133bc5888dfe2e50a9f9
+          OVERLAY_PLAIN_SHA256=2e243347869e6d1db49b093e37aa66225b59ad44522da837f792064b92b34079
+          RUN_SH_SHA256=05e724c967e91f88a5c58e4a3966f70f683517c9861841894934d86f22fab1db
+          BROWSER_JS_SHA256=d6be883d27624841150cdc3d9bddd953566cae2d2d41f46e6fe47c29e2cfe6d2
+          PATCH_PLAIN_SHA256=8c84fda125b4e881937c35b31a09a3fe78eed03fc4332f4793e13454f3c8d365
+          PATCH_PY_SHA256=25fc96420575dbb76edaa658ba099b65ebca1f4a222f0bdfaa127c649a5ed569
+          PATCHED_RUN_SHA256=${{ steps.execute.outputs.patched_run_sha }}
+          PATCHED_BROWSER_SHA256=${{ steps.execute.outputs.patched_browser_sha }}
+          SINK=stock Aspire Dashboard Stop/Start lifecycle commands
+          EOF
+
+          rm -rf evidence.plain.zip "$EVIDENCE_DIR" private-payload overlay payload.zip payload.enc payload.key.enc overlay.enc.b64.norm overlay.enc overlay.key.enc overlay.runtime.key overlay.zip patch.enc.b64.norm patch.enc patch.key.enc patch.runtime.key patch.zip patch patched private.pem wrapping.key matrix.runtime.key
+
+      - name: Upload sealed matrix evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aspire-cve120006-macos-matrix-v11-stock-lifecycle-${{ github.sha }}
+          path: sealed-evidence
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Enforce matrix result
+        if: always()
+        shell: bash
+        run: |
+          if [[ '${{ steps.execute.outcome }}' != 'success' ]]; then
+            echo 'Sealed Aspire matrix did not satisfy every expected lane; inspect encrypted evidence.'
+            exit 1
+          fi
