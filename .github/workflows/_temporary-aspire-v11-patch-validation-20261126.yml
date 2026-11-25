@@ -1,0 +1,102 @@
+name: Validate sealed Aspire v11 stock lifecycle patch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v11-patch-validation-20261126.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout sealed inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Decrypt pinned v10 source, apply v11 patch, and validate
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$WRAPPING_KEY_B64"
+
+          meta_get() {
+            awk -F= -v key="$1" '$1 == key { print substr($0, index($0, "=") + 1); exit }' sealed/aspire-macos-matrix-v10-selfcontained-overlay.metadata
+          }
+          patch_meta_get() {
+            awk -F= -v key="$1" '$1 == key { print substr($0, index($0, "=") + 1); exit }' sealed/aspire-v11-stock-lifecycle-patch.metadata
+          }
+
+          printf '%s' "$WRAPPING_KEY_B64" | openssl base64 -d -A > wrapping.key
+          test "$(wc -c < wrapping.key | tr -d ' ')" = "32"
+          WRAP_KEY_HEX="$(od -An -tx1 -v wrapping.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$WRAP_KEY_HEX" -iv "$(tr -d '\r\n ' < bootstrap/private.iv.hex)" \
+            -in bootstrap/private.pem.enc -out private.pem
+
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v10-selfcontained-overlay.enc.b64 > overlay.enc.b64.norm
+          test "$(sha256sum overlay.enc.b64.norm | awk '{print $1}')" = "$(meta_get OVERLAY_B64_NORMALIZED_SHA256)"
+          openssl base64 -d -A -in overlay.enc.b64.norm -out overlay.enc
+          test "$(sha256sum overlay.enc | awk '{print $1}')" = "$(meta_get OVERLAY_CIPHER_SHA256)"
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v10-selfcontained-overlay.key.enc.b64 | openssl base64 -d -A > overlay.key.enc
+          test "$(sha256sum overlay.key.enc | awk '{print $1}')" = "$(meta_get OVERLAY_KEY_CIPHER_SHA256)"
+          openssl pkeyutl -decrypt -inkey private.pem -in overlay.key.enc -out overlay.runtime.key \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          test "$(wc -c < overlay.runtime.key | tr -d ' ')" = "32"
+          OVERLAY_KEY_HEX="$(od -An -tx1 -v overlay.runtime.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$OVERLAY_KEY_HEX" -iv "$(meta_get OVERLAY_IV_HEX)" \
+            -in overlay.enc -out overlay.zip
+          test "$(sha256sum overlay.zip | awk '{print $1}')" = "$(meta_get OVERLAY_PLAIN_SHA256)"
+          test "$(unzip -Z1 overlay.zip | sort | tr '\n' '|')" = "aspire-macos-matrix-v10-selfcontained/browser.js|aspire-macos-matrix-v10-selfcontained/run.sh|"
+          mkdir overlay
+          unzip -q overlay.zip -d overlay
+          BASE=overlay/aspire-macos-matrix-v10-selfcontained
+          test "$(sha256sum "$BASE/run.sh" | awk '{print $1}')" = "$(meta_get RUN_SH_SHA256)"
+          test "$(sha256sum "$BASE/browser.js" | awk '{print $1}')" = "$(meta_get BROWSER_JS_SHA256)"
+
+          tr -d '\r\n ' < sealed/aspire-v11-stock-lifecycle-patch.enc.b64 > patch.enc.b64.norm
+          test "$(sha256sum patch.enc.b64.norm | awk '{print $1}')" = "$(patch_meta_get PATCH_B64_NORMALIZED_SHA256)"
+          openssl base64 -d -A -in patch.enc.b64.norm -out patch.enc
+          test "$(sha256sum patch.enc | awk '{print $1}')" = "$(patch_meta_get PATCH_CIPHER_SHA256)"
+          tr -d '\r\n ' < sealed/aspire-v11-stock-lifecycle-patch.key.enc.b64 | openssl base64 -d -A > patch.key.enc
+          test "$(sha256sum patch.key.enc | awk '{print $1}')" = "$(patch_meta_get PATCH_KEY_CIPHER_SHA256)"
+          openssl pkeyutl -decrypt -inkey private.pem -in patch.key.enc -out patch.runtime.key \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          test "$(wc -c < patch.runtime.key | tr -d ' ')" = "32"
+          PATCH_KEY_HEX="$(od -An -tx1 -v patch.runtime.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$PATCH_KEY_HEX" -iv "$(patch_meta_get PATCH_IV_HEX)" \
+            -in patch.enc -out patch.zip
+          test "$(sha256sum patch.zip | awk '{print $1}')" = "$(patch_meta_get PATCH_PLAIN_SHA256)"
+          test "$(unzip -Z1 patch.zip | sort | tr '\n' '|')" = "aspire-v11-stock-lifecycle-patch/patch.py|"
+          mkdir patch
+          unzip -q patch.zip -d patch
+          PATCH_SCRIPT=patch/aspire-v11-stock-lifecycle-patch/patch.py
+          test "$(sha256sum "$PATCH_SCRIPT" | awk '{print $1}')" = "$(patch_meta_get PATCH_PY_SHA256)"
+
+          python3 "$PATCH_SCRIPT" "$BASE" patched > patch-result.json
+          bash -n patched/run.sh
+          node --check patched/browser.js
+          RUN_SHA="$(sha256sum patched/run.sh | awk '{print $1}')"
+          BROWSER_SHA="$(sha256sum patched/browser.js | awk '{print $1}')"
+          python3 - patched/PATCH_MANIFEST.json "$RUN_SHA" "$BROWSER_SHA" <<'PY'
+          import json,sys
+          p,run_sha,browser_sha=sys.argv[1:]
+          j=json.load(open(p))
+          assert j['base_run_sha256']=='05e724c967e91f88a5c58e4a3966f70f683517c9861841894934d86f22fab1db'
+          assert j['base_browser_sha256']=='d6be883d27624841150cdc3d9bddd953566cae2d2d41f46e6fe47c29e2cfe6d2'
+          assert j['patched_run_sha256']==run_sha
+          assert j['patched_browser_sha256']==browser_sha
+          assert j['synthetic_privileged_command_removed'] is True
+          assert j['sink']=='stock Aspire Dashboard Stop/Start lifecycle commands'
+          print(json.dumps(j,sort_keys=True))
+          PY
+          ! grep -R -n -E 'host-proof|Write host proof|PROOF_PATH|clickHostProof' patched
+          grep -q 'VICTIM_RESOURCE=victim' patched/run.sh
+          grep -q "invokeLifecycleCommand(page, 'Stop')" patched/browser.js
+          grep -q "invokeLifecycleCommand(page, 'Start')" patched/browser.js
+          printf 'PATCH_VALIDATION=PASS\nPATCHED_RUN_SHA256=%s\nPATCHED_BROWSER_SHA256=%s\n' "$RUN_SHA" "$BROWSER_SHA"
