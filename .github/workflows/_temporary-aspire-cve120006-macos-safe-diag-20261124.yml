@@ -74,6 +74,25 @@ jobs:
           echo "matrix_rc=$MATRIX_RC" >> "$GITHUB_OUTPUT"
           exit "$MATRIX_RC"
 
+      - name: Emit metadata-only build output diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          echo '=== DOTNET VERSION ==='
+          dotnet --info | sed -n '1,80p' || true
+          echo '=== ASPIRE.HOSTING BUILD OUTPUTS ==='
+          find zdb-matrix-work -type f \
+            \( -name 'Aspire.Hosting.dll' -o -name 'Aspire.Hosting.deps.json' -o -name 'Aspire.Hosting.runtimeconfig.json' \) \
+            -print 2>/dev/null | sort || true
+          echo '=== RELEASE/TFM DIRECTORIES ==='
+          find zdb-matrix-work/aspire-v17-source -maxdepth 9 -type d \
+            \( -name Release -o -name net10.0 -o -name net11.0 -o -name artifacts -o -name bin \) \
+            -print 2>/dev/null | sort | head -400 || true
+          echo '=== SOURCE ROOT SUMMARY ==='
+          du -sh zdb-matrix-work/aspire-v17-source 2>/dev/null || true
+          find zdb-matrix-work/aspire-v17-source -maxdepth 3 -type d -print 2>/dev/null | sort | head -300 || true
+
       - name: Seal matrix evidence
         if: always()
         shell: bash
