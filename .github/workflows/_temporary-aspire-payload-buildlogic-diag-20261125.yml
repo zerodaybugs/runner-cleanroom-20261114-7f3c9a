@@ -1,0 +1,51 @@
+name: Sealed Aspire payload build-logic diagnostic
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-payload-buildlogic-diag-20261125.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-build-logic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout sealed inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Decrypt payload and print build-only metadata
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$WRAPPING_KEY_B64"
+          printf '%s' "$WRAPPING_KEY_B64" | openssl base64 -d -A > wrapping.key
+          test "$(wc -c < wrapping.key | tr -d ' ')" = "32"
+          WRAP_KEY_HEX="$(od -An -tx1 -v wrapping.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$WRAP_KEY_HEX" -iv "$(tr -d '\r\n ' < bootstrap/private.iv.hex)" -in bootstrap/private.pem.enc -out private.pem
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v2.key.enc.b64 | openssl base64 -d -A > payload.key.enc
+          openssl pkeyutl -decrypt -inkey private.pem -in payload.key.enc -out matrix.runtime.key -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v2.enc.b64 | openssl base64 -d -A > payload.enc
+          KEY_HEX="$(od -An -tx1 -v matrix.runtime.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$KEY_HEX" -iv "206224599d55f53eba5616f78531addb" -in payload.enc -out payload.zip
+          test "$(sha256sum payload.zip | awk '{print $1}')" = "ba640f7ae180b198351ff27f579158fabad7a7057261133bc5888dfe2e50a9f9"
+          mkdir private-payload
+          unzip -q payload.zip -d private-payload
+          SCRIPT=private-payload/aspire-macos-matrix-v2/run.sh
+          test -f "$SCRIPT"
+          echo '=== PAYLOAD FILE NAMES ==='
+          find private-payload -maxdepth 3 -type f -printf '%P\n' | sort
+          echo '=== BUILD-ONLY SCRIPT LINES ==='
+          grep -nE 'aspire-v17-source|Aspire.Hosting\.dll|dotnet (build|restore)|curl|unzip|tar |ditto|github\.com/microsoft/aspire' "$SCRIPT" || true
+          echo '=== EMBEDDED ARCHIVE METADATA ==='
+          find private-payload -maxdepth 4 -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print0 | while IFS= read -r -d '' f; do
+            sha256sum "$f"
+            unzip -l "$f" 2>/dev/null | sed -n '1,12p' || true
+          done
+          rm -rf private-payload payload.zip payload.enc payload.key.enc private.pem wrapping.key matrix.runtime.key
