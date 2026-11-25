@@ -132,16 +132,16 @@ jobs:
           test "$PATCHED_RUN_SHA" = "$(patch_meta_get PATCHED_RUN_SHA256)"
           test "$PATCHED_BROWSER_SHA" = "$(patch_meta_get PATCHED_BROWSER_SHA256)"
           python3 - "$PATCH_MANIFEST" "$PATCHED_RUN_SHA" "$PATCHED_BROWSER_SHA" <<'PY_MANIFEST'
-import json,sys
-p,run_sha,browser_sha=sys.argv[1:]
-j=json.load(open(p))
-assert j['base_run_sha256']=='05e724c967e91f88a5c58e4a3966f70f683517c9861841894934d86f22fab1db'
-assert j['base_browser_sha256']=='d6be883d27624841150cdc3d9bddd953566cae2d2d41f46e6fe47c29e2cfe6d2'
-assert j['patched_run_sha256']==run_sha
-assert j['patched_browser_sha256']==browser_sha
-assert j['synthetic_privileged_command_removed'] is True
-assert j['sink']=='stock Aspire Dashboard Stop/Start lifecycle commands'
-PY_MANIFEST
+          import json,sys
+          p,run_sha,browser_sha=sys.argv[1:]
+          j=json.load(open(p))
+          assert j['base_run_sha256']=='05e724c967e91f88a5c58e4a3966f70f683517c9861841894934d86f22fab1db'
+          assert j['base_browser_sha256']=='d6be883d27624841150cdc3d9bddd953566cae2d2d41f46e6fe47c29e2cfe6d2'
+          assert j['patched_run_sha256']==run_sha
+          assert j['patched_browser_sha256']==browser_sha
+          assert j['synthetic_privileged_command_removed'] is True
+          assert j['sink']=='stock Aspire Dashboard Stop/Start lifecycle commands'
+          PY_MANIFEST
           bash -n "$PATCHED_RUN"
           node --check "$PATCHED_BROWSER"
           cp "$PATCH_MANIFEST" "$EVIDENCE_DIR/PATCH_MANIFEST.json"
