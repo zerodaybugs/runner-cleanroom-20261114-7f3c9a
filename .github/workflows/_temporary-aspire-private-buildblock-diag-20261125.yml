@@ -1,4 +1,4 @@
-name: Encrypted Aspire private build-block diagnostic
+name: Encrypted Aspire private harness diagnostic
 
 on:
   push:
@@ -11,14 +11,14 @@ permissions:
   contents: read
 
 jobs:
-  export-encrypted-block:
+  export-encrypted-harness:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout sealed inputs
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
-      - name: Decrypt payload and re-encrypt selected build block
+      - name: Decrypt payload and re-encrypt full harness
         shell: bash
         env:
           WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
@@ -36,27 +36,27 @@ jobs:
           openssl enc -d -aes-256-cbc -K "$KEY_HEX" -iv "206224599d55f53eba5616f78531addb" -in payload.enc -out payload.zip
           mkdir private-payload encrypted-diagnostic
           unzip -q payload.zip -d private-payload
-          sed -n '118,146p' private-payload/aspire-macos-matrix-v2/run.sh > build-block.txt
-          test -s build-block.txt
+          cp private-payload/aspire-macos-matrix-v2/run.sh harness.txt
+          test -s harness.txt
 
           openssl rand 32 > diagnostic.key
           openssl rand 16 > diagnostic.iv
           DIAG_KEY_HEX="$(od -An -tx1 -v diagnostic.key | tr -d ' \n')"
           DIAG_IV_HEX="$(od -An -tx1 -v diagnostic.iv | tr -d ' \n')"
-          openssl enc -aes-256-cbc -K "$DIAG_KEY_HEX" -iv "$DIAG_IV_HEX" -in build-block.txt -out encrypted-diagnostic/build-block.enc
+          openssl enc -aes-256-cbc -K "$DIAG_KEY_HEX" -iv "$DIAG_IV_HEX" -in harness.txt -out encrypted-diagnostic/harness.enc
           printf '%s' "$DIAG_PUBLIC_DER_B64" | openssl base64 -d -A > public.der
           openssl pkey -pubin -inform DER -in public.der -out public.pem
           openssl pkeyutl -encrypt -pubin -inkey public.pem -in diagnostic.key -out encrypted-diagnostic/key.enc -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
           printf '%s\n' "$DIAG_IV_HEX" > encrypted-diagnostic/iv.hex
-          sha256sum build-block.txt | awk '{print $1}' > encrypted-diagnostic/plain.sha256
-          sha256sum encrypted-diagnostic/build-block.enc | awk '{print $1}' > encrypted-diagnostic/cipher.sha256
-          printf 'LINES=118-146\nFORMAT=RSA-OAEP-SHA256+A256CBC\n' > encrypted-diagnostic/metadata.txt
-          rm -rf private-payload build-block.txt diagnostic.key diagnostic.iv payload.zip payload.enc payload.key.enc private.pem wrapping.key matrix.runtime.key public.der public.pem
+          sha256sum harness.txt | awk '{print $1}' > encrypted-diagnostic/plain.sha256
+          sha256sum encrypted-diagnostic/harness.enc | awk '{print $1}' > encrypted-diagnostic/cipher.sha256
+          printf 'CONTENT=full-run.sh\nFORMAT=RSA-OAEP-SHA256+A256CBC\n' > encrypted-diagnostic/metadata.txt
+          rm -rf private-payload harness.txt diagnostic.key diagnostic.iv payload.zip payload.enc payload.key.enc private.pem wrapping.key matrix.runtime.key public.der public.pem
 
       - name: Upload encrypted diagnostic
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: aspire-private-build-block-${{ github.run_id }}
+          name: aspire-private-harness-${{ github.run_id }}
           path: encrypted-diagnostic
           if-no-files-found: error
           retention-days: 1
