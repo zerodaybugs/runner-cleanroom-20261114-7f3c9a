@@ -1,0 +1,46 @@
+name: Aspire v17 macOS build-path diagnostic
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v17-macos-buildpath-diag-20261125.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  locate-build-output:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Install exact current .NET SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 10.0.404
+          cache: false
+
+      - name: Clone exact Aspire release
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --depth 1 --branch v17.0.0 https://github.com/microsoft/aspire.git aspire-v17
+          cd aspire-v17
+          test "$(git rev-parse HEAD)" = "4fb77196f01ef1de5cba37f4f3124ac12db12a1a"
+
+      - name: Build exact project and locate output
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd aspire-v17
+          dotnet --info
+          dotnet build src/Aspire.Hosting/Aspire.Hosting.csproj -c Release --nologo
+          mapfile -t DLLS < <(find . -type f -name Aspire.Hosting.dll -path '*/Release/*' | sort)
+          printf 'FOUND_COUNT=%s\n' "${#DLLS[@]}"
+          printf '%s\n' "${DLLS[@]}"
+          test "${#DLLS[@]}" -ge 1
+          for dll in "${DLLS[@]}"; do
+            shasum -a 256 "$dll"
+            file "$dll"
+          done
