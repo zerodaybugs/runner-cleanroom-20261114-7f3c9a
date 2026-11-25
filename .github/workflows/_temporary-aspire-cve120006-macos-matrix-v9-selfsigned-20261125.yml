@@ -105,10 +105,13 @@ jobs:
           bash -n private-payload/aspire-macos-matrix-v2/run.sh
           node --check private-payload/aspire-macos-matrix-v2/browser.js
 
+          EVIDENCE_DIR=evidence-aspire120006-macos-v9-selfsigned
+          mkdir -p "$EVIDENCE_DIR"
           set +e
-          private-payload/aspire-macos-matrix-v2/run.sh
+          bash -x private-payload/aspire-macos-matrix-v2/run.sh > "$EVIDENCE_DIR/bootstrap-trace.log" 2>&1
           MATRIX_RC=$?
           set -e
+          printf 'MATRIX_RC=%s\n' "$MATRIX_RC" > "$EVIDENCE_DIR/bootstrap-status.txt"
           echo "matrix_rc=$MATRIX_RC" >> "$GITHUB_OUTPUT"
           exit "$MATRIX_RC"
 
@@ -122,7 +125,7 @@ jobs:
           echo '=== ASPIRE.HOSTING OUTPUTS ==='
           find zdb-matrix-work -type f -name 'Aspire.Hosting.dll' -print 2>/dev/null | sort || true
           echo '=== LANE STATUS FILES ==='
-          find evidence-aspire120006-macos-v9-selfsigned -maxdepth 2 -type f \( -name status.txt -o -name assertion.txt -o -name fix-dll.sha256 \) -print 2>/dev/null | sort || true
+          find evidence-aspire120006-macos-v9-selfsigned -maxdepth 2 -type f \( -name status.txt -o -name assertion.txt -o -name fix-dll.sha256 -o -name bootstrap-status.txt \) -print 2>/dev/null | sort || true
 
       - name: Seal matrix evidence
         if: always()
