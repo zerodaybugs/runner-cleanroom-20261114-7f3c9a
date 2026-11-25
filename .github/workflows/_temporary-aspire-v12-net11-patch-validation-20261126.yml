@@ -1,0 +1,114 @@
+name: Validate sealed Aspire v12 .NET 11 patch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v12-net11-patch-validation-20261126.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout sealed inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install exact .NET 11 SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 11.0.100
+          cache: false
+
+      - name: Decrypt v10, apply v11 and v12 patches, validate exact output
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          meta() { awk -F= -v key="$2" '$1 == key { print substr($0,index($0,"=")+1); exit }' "$1"; }
+
+          printf '%s' "$WRAPPING_KEY_B64" | openssl base64 -d -A > wrapping.key
+          test "$(wc -c < wrapping.key | tr -d ' ')" = 32
+          WRAP_HEX="$(od -An -tx1 -v wrapping.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$WRAP_HEX" -iv "$(tr -d '\r\n ' < bootstrap/private.iv.hex)" \
+            -in bootstrap/private.pem.enc -out private.pem
+
+          decrypt_payload() {
+            local prefix="$1" metadata="$2" outdir="$3" expected_inventory="$4"
+            tr -d '\r\n ' < "sealed/${prefix}.enc.b64" > payload.b64
+            test "$(sha256sum payload.b64 | awk '{print $1}')" = "$(meta "$metadata" PATCH_B64_NORMALIZED_SHA256)"
+            openssl base64 -d -A -in payload.b64 -out payload.enc
+            test "$(sha256sum payload.enc | awk '{print $1}')" = "$(meta "$metadata" PATCH_CIPHER_SHA256)"
+            tr -d '\r\n ' < "sealed/${prefix}.key.enc.b64" | openssl base64 -d -A > key.enc
+            test "$(sha256sum key.enc | awk '{print $1}')" = "$(meta "$metadata" PATCH_KEY_CIPHER_SHA256)"
+            openssl pkeyutl -decrypt -inkey private.pem -in key.enc -out runtime.key \
+              -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+            KEY_HEX="$(od -An -tx1 -v runtime.key | tr -d ' \n')"
+            openssl enc -d -aes-256-cbc -K "$KEY_HEX" -iv "$(meta "$metadata" PATCH_IV_HEX)" \
+              -in payload.enc -out payload.zip
+            test "$(sha256sum payload.zip | awk '{print $1}')" = "$(meta "$metadata" PATCH_PLAIN_SHA256)"
+            test "$(unzip -Z1 payload.zip | sort | tr '\n' '|')" = "$expected_inventory"
+            mkdir -p "$outdir"
+            unzip -q payload.zip -d "$outdir"
+            rm -f payload.b64 payload.enc key.enc runtime.key payload.zip
+          }
+
+          V10_META=sealed/aspire-macos-matrix-v10-selfcontained-overlay.metadata
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v10-selfcontained-overlay.enc.b64 > v10.b64
+          test "$(sha256sum v10.b64 | awk '{print $1}')" = "$(meta "$V10_META" OVERLAY_B64_NORMALIZED_SHA256)"
+          openssl base64 -d -A -in v10.b64 -out v10.enc
+          test "$(sha256sum v10.enc | awk '{print $1}')" = "$(meta "$V10_META" OVERLAY_CIPHER_SHA256)"
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v10-selfcontained-overlay.key.enc.b64 | openssl base64 -d -A > v10.key.enc
+          openssl pkeyutl -decrypt -inkey private.pem -in v10.key.enc -out v10.key \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          V10_KEY_HEX="$(od -An -tx1 -v v10.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$V10_KEY_HEX" -iv "$(meta "$V10_META" OVERLAY_IV_HEX)" \
+            -in v10.enc -out v10.zip
+          test "$(sha256sum v10.zip | awk '{print $1}')" = "$(meta "$V10_META" OVERLAY_PLAIN_SHA256)"
+          mkdir v10
+          unzip -q v10.zip -d v10
+          BASE=v10/aspire-macos-matrix-v10-selfcontained
+          test "$(sha256sum "$BASE/run.sh" | awk '{print $1}')" = "$(meta "$V10_META" RUN_SH_SHA256)"
+          test "$(sha256sum "$BASE/browser.js" | awk '{print $1}')" = "$(meta "$V10_META" BROWSER_JS_SHA256)"
+
+          V11_META=sealed/aspire-v11-stock-lifecycle-patch.metadata
+          decrypt_payload aspire-v11-stock-lifecycle-patch "$V11_META" v11patch 'aspire-v11-stock-lifecycle-patch/patch.py|'
+          V11_SCRIPT=v11patch/aspire-v11-stock-lifecycle-patch/patch.py
+          test "$(sha256sum "$V11_SCRIPT" | awk '{print $1}')" = "$(meta "$V11_META" PATCH_PY_SHA256)"
+          python3 "$V11_SCRIPT" "$BASE" v11 > v11-result.json
+          test "$(sha256sum v11/run.sh | awk '{print $1}')" = "$(meta "$V11_META" PATCHED_RUN_SHA256)"
+          test "$(sha256sum v11/browser.js | awk '{print $1}')" = "$(meta "$V11_META" PATCHED_BROWSER_SHA256)"
+
+          V12_META=sealed/aspire-v12-net11-patch.metadata
+          decrypt_payload aspire-v12-net11-patch "$V12_META" v12patch 'aspire-v12-net11-patch/patch.py|'
+          V12_SCRIPT=v12patch/aspire-v12-net11-patch/patch.py
+          test "$(sha256sum "$V12_SCRIPT" | awk '{print $1}')" = "$(meta "$V12_META" PATCH_PY_SHA256)"
+          python3 "$V12_SCRIPT" v11 v12 > v12-result.json
+          bash -n v12/run.sh
+          node --check v12/browser.js
+          dotnet --info | sed -n '1,70p'
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          j=json.loads(Path('v12/NET11_PATCH_MANIFEST.json').read_text())
+          assert j['base_run_sha256']=='356f1088f3d417ef30c40ca6e7a7985f48df6f5a1847ba3a108334e78960a9cc'
+          assert j['base_browser_sha256']=='616a1616a44d50a966f9f9469cd5d885d02ec92cd99c109054043c9a18540c90'
+          assert j['sdk']=='11.0.100'
+          assert j['runtime']=='11.0.0'
+          assert j['target_framework']=='net11.0'
+          s=Path('v12/run.sh').read_text()
+          assert s.count('<TargetFramework>net11.0</TargetFramework>')==2
+          assert '"version":"11.0.100"' in s
+          assert 'bin/Debug/net11.0/Aspire.Hosting.dll' in s
+          assert '<TargetFramework>net10.0</TargetFramework>' not in s
+          assert 'bin/Debug/net10.0/Aspire.Hosting.dll' not in s
+          print(json.dumps(j,sort_keys=True))
+          PY
+          ! grep -R -n -E 'host-proof|Write host proof|PROOF_PATH|clickHostProof' v12
+          printf 'NET11_PATCH_VALIDATION=PASS\nV12_RUN_SHA256=%s\nV12_BROWSER_SHA256=%s\n' \
+            "$(sha256sum v12/run.sh | awk '{print $1}')" "$(sha256sum v12/browser.js | awk '{print $1}')"
