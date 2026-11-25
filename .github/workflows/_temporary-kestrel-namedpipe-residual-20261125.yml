@@ -6,7 +6,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/_temporary-kestrel-namedpipe-residual-20261125.yml'
-      - 'sealed/kestrel-namedpipe-residual-v1/**'
+      - 'sealed/kestrel-namedpipe-residual-v2/**'
 
 permissions:
   contents: read
@@ -67,7 +67,7 @@ jobs:
             finally { $decryptor.Dispose() }
           } finally { $aes.Dispose() }
 
-          $sealedRoot = Join-Path $PWD 'sealed/kestrel-namedpipe-residual-v1'
+          $sealedRoot = Join-Path $PWD 'sealed/kestrel-namedpipe-residual-v2'
           $rsa = [Security.Cryptography.RSA]::Create()
           try {
             $rsa.ImportFromPem([Text.Encoding]::ASCII.GetString($privatePemBytes))
