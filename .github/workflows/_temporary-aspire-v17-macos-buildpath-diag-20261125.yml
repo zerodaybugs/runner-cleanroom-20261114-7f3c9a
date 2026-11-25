@@ -27,7 +27,9 @@ jobs:
           set -euo pipefail
           git clone --filter=blob:none --depth 1 --branch v17.0.0 https://github.com/microsoft/aspire.git aspire-v17
           cd aspire-v17
-          test "$(git rev-parse HEAD)" = "4fb77196f01ef1de5cba37f4f3124ac12db12a1a"
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          printf 'ASPIRE_V17_TAG_SHA=%s\n' "$ACTUAL_SHA"
+          test "$ACTUAL_SHA" = "2d325b13709752ba6d9a943635c5e2940a2530c0"
 
       - name: Build exact project and locate output
         shell: bash
@@ -36,11 +38,12 @@ jobs:
           cd aspire-v17
           dotnet --info
           dotnet build src/Aspire.Hosting/Aspire.Hosting.csproj -c Release --nologo
-          mapfile -t DLLS < <(find . -type f -name Aspire.Hosting.dll -path '*/Release/*' | sort)
-          printf 'FOUND_COUNT=%s\n' "${#DLLS[@]}"
-          printf '%s\n' "${DLLS[@]}"
-          test "${#DLLS[@]}" -ge 1
-          for dll in "${DLLS[@]}"; do
+          find . -type f -name Aspire.Hosting.dll -path '*/Release/*' | sort > /tmp/aspire-hosting-dlls.txt
+          FOUND_COUNT="$(grep -c . /tmp/aspire-hosting-dlls.txt || true)"
+          printf 'FOUND_COUNT=%s\n' "$FOUND_COUNT"
+          cat /tmp/aspire-hosting-dlls.txt
+          test "$FOUND_COUNT" -ge 1
+          while IFS= read -r dll; do
             shasum -a 256 "$dll"
             file "$dll"
-          done
+          done < /tmp/aspire-hosting-dlls.txt
