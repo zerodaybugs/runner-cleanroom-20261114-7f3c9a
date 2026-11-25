@@ -9,7 +9,6 @@ on:
 
 permissions:
   contents: read
-
 jobs:
   exact-ga-windows:
     strategy:
@@ -36,7 +35,8 @@ jobs:
           WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
           DOTNET_NOLOGO: '1'
           DOTNET_CLI_TELEMETRY_OPTOUT: '1'
-          DOTNET_ROLL_FORWARD: Disable
+          DOTNET_ROLL_FORWARD: LatestPatch
+          DOTNET_ROLL_FORWARD_TO_PRERELEASE: '0'
           DOTNET_MULTILEVEL_LOOKUP: '0'
         run: |
           $ErrorActionPreference = 'Stop'
@@ -94,8 +94,27 @@ jobs:
             $text = $text.Replace('net11.0','net10.0').Replace('11.0.100','10.0.404').Replace('.NET 11.0.0','.NET 10.0.15').Replace('11.0.0.0','10.0.0.0')
             Set-Content -LiteralPath $_.FullName -Value $text -NoNewline -Encoding utf8
           }
-          & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $root 'run.ps1')
-          if ($LASTEXITCODE -ne 0) { throw "probe failed: $LASTEXITCODE" }
+          $globalJson = [ordered]@{
+            sdk = [ordered]@{
+              version = '10.0.404'
+              rollForward = 'disable'
+              allowPrerelease = $false
+            }
+          } | ConvertTo-Json -Depth 5
+          Set-Content -LiteralPath (Join-Path $root 'global.json') -Value $globalJson -Encoding utf8NoBOM
+
+          Push-Location $root
+          try {
+            $actualSdk = (& dotnet --version).Trim()
+            if ($actualSdk -ne '10.0.404') { throw "SDK mismatch: $actualSdk" }
+            $runtimeRows = @(& dotnet --list-runtimes)
+            if (-not ($runtimeRows -match '^Microsoft.NETCore.App 10\.0\.15 \[')) { throw 'Microsoft.NETCore.App 10.0.15 missing' }
+            if (-not ($runtimeRows -match '^Microsoft.AspNetCore.App 10\.0\.15 \[')) { throw 'Microsoft.AspNetCore.App 10.0.15 missing' }
+            & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $root 'run.ps1')
+            if ($LASTEXITCODE -ne 0) { throw "probe failed: $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
 
       - name: Seal evidence
         if: always()
@@ -142,9 +161,20 @@ jobs:
             'SOURCE_SHA=${{ github.sha }}',
             'EXECUTE_OUTCOME=${{ steps.execute.outcome }}'
           ) | Set-Content (Join-Path $sealed 'metadata.txt') -Encoding ascii
-          Remove-Item -LiteralPath $zipPath,$keyPath,$payloadZip -Force -ErrorAction SilentlyContinue
-          Remove-Item -LiteralPath $payloadDir -Recurse -Force -ErrorAction SilentlyContinue
-          foreach ($dir in $dirs) { Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+          Remove-Item -LiteralPath $zipPath,$keyPath -Force -ErrorAction SilentlyContinue
+          foreach ($candidate in @(
+            (Join-Path $PWD 'pathstring-staticfiles.payload.zip'),
+            (Join-Path $PWD 'pathstring-staticfiles-payload')
+          )) {
+            if (Test-Path -LiteralPath $candidate) {
+              Remove-Item -LiteralPath $candidate -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          foreach ($dir in $dirs) {
+            if (Test-Path -LiteralPath $dir.FullName) {
+              Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
 
       - name: Upload sealed evidence
         if: always()
