@@ -1,0 +1,61 @@
+name: Fix Aspire v11 workflow indentation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-fix-aspire-v11-workflow-indent-20261126.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Indent embedded Python block and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET=.github/workflows/_temporary-aspire-cve120006-macos-matrix-v11-stock-lifecycle-20261126.yml
+          python3 - "$TARGET" <<'PY'
+          from pathlib import Path
+          import sys
+          p=Path(sys.argv[1])
+          s=p.read_text()
+          old="""import json,sys
+          p,run_sha,browser_sha=sys.argv[1:]
+          j=json.load(open(p))
+          assert j['base_run_sha256']=='05e724c967e91f88a5c58e4a3966f70f683517c9861841894934d86f22fab1db'
+          assert j['base_browser_sha256']=='d6be883d27624841150cdc3d9bddd953566cae2d2d41f46e6fe47c29e2cfe6d2'
+          assert j['patched_run_sha256']==run_sha
+          assert j['patched_browser_sha256']==browser_sha
+          assert j['synthetic_privileged_command_removed'] is True
+          assert j['sink']=='stock Aspire Dashboard Stop/Start lifecycle commands'
+          PY_MANIFEST
+          """
+          new="""          import json,sys
+                    p,run_sha,browser_sha=sys.argv[1:]
+                    j=json.load(open(p))
+                    assert j['base_run_sha256']=='05e724c967e91f88a5c58e4a3966f70f683517c9861841894934d86f22fab1db'
+                    assert j['base_browser_sha256']=='d6be883d27624841150cdc3d9bddd953566cae2d2d41f46e6fe47c29e2cfe6d2'
+                    assert j['patched_run_sha256']==run_sha
+                    assert j['patched_browser_sha256']==browser_sha
+                    assert j['synthetic_privileged_command_removed'] is True
+                    assert j['sink']=='stock Aspire Dashboard Stop/Start lifecycle commands'
+          PY_MANIFEST
+          """
+          if s.count(old) != 1:
+              raise SystemExit(f'expected one unindented block, found {s.count(old)}')
+          p.write_text(s.replace(old,new,1))
+          PY
+          git config user.name zerodaybugs
+          git config user.email 80965714+zerodaybugs@users.noreply.github.com
+          git add "$TARGET"
+          git diff --cached --check
+          git commit -m 'fix Aspire v11 embedded Python indentation'
+          git push origin HEAD:main
