@@ -1,0 +1,7 @@
+UTC=2026-11-25T13:05:00Z
+PURPOSE=final-minimized-submit-ready-pathstring-staticfiles-validation-v2
+SDK10=10.0.404
+RUNTIME10=10.0.15
+SDK11=11.0.100
+RUNTIME11=11.0.0
+PAYLOAD_PLAIN_SHA256=a8b923f7bac8ac2a00140cbaef7751bed13323318c1d96ef0ebc740286d1dac7
