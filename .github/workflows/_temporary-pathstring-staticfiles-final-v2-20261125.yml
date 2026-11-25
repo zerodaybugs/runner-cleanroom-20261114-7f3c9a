@@ -1,0 +1,62 @@
+name: Sealed PathString StaticFiles final PoC matrix v2
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'triggers/pathstring-staticfiles-final-v2-20261125.txt'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2022, lane: net10, sdk: 10.0.404, runtime: 10.0.15 }
+          - { os: windows-2025, lane: net10, sdk: 10.0.404, runtime: 10.0.15 }
+          - { os: windows-2022, lane: net11, sdk: 11.0.100, runtime: 11.0.0 }
+          - { os: windows-2025, lane: net11, sdk: 11.0.100, runtime: 11.0.0 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    steps:
+      - name: Checkout sealed clean-room inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install exact SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+          cache: false
+      - name: Execute and seal final private PoC
+        id: execute
+        continue-on-error: true
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          DOTNET_NOLOGO: '1'
+          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+          DOTNET_MULTILEVEL_LOOKUP: '0'
+          DOTNET_ROLL_FORWARD: LatestPatch
+          DOTNET_ROLL_FORWARD_TO_PRERELEASE: '0'
+        run: >-
+          & ./run-sealed-pathstring-final-v2.ps1
+          -Lane '${{ matrix.lane }}'
+          -Runner '${{ matrix.os }}'
+          -RunId '${{ github.run_id }}'
+          -SourceSha '${{ github.sha }}'
+      - name: Upload sealed final evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pathstring-staticfiles-final-v2-${{ matrix.lane }}-${{ matrix.os }}-${{ github.sha }}
+          path: sealed-final-evidence
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+      - name: Enforce final result
+        if: always()
+        shell: pwsh
+        run: |
+          if ('${{ steps.execute.outcome }}' -ne 'success') {
+            throw 'The final private PoC did not satisfy every exact-GA control.'
+          }
