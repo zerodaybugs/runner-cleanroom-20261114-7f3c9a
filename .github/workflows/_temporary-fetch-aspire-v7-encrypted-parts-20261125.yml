@@ -1,0 +1,45 @@
+name: Fetch verified encrypted Aspire v7 parts
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-fetch-aspire-v7-encrypted-parts-20261125.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Download, verify, and commit ciphertext parts
+        shell: bash
+        env:
+          BASE_URL: https://bb663692af8a74.app.lhr.life
+        run: |
+          set -euo pipefail
+          mkdir -p incoming sealed
+          for i in 00 01 02 03; do
+            curl --retry 20 --retry-delay 1 --retry-all-errors -fsSL "$BASE_URL/part-$i" -o "incoming/part-$i"
+          done
+          cat > incoming/SHA256SUMS <<'EOF'
+          59f0f9b8ed833ad26b0ff188c3f478192fb9ed783f7cc53b78ca3f8f61070b8a  incoming/part-00
+          ab994ff727e327e1354208c557b5c8d8c7349aef8d8308ad68e9940f9c147e05  incoming/part-01
+          3dc4151672bd33276ee7d26958912217cd987a216b61e29901521a48d3cc8254  incoming/part-02
+          fe9439561c33837618423e4dcb16ccf71d910f5c358b0b6f301cc176c01a64d4  incoming/part-03
+          EOF
+          sha256sum -c incoming/SHA256SUMS
+          for i in 00 01 02 03; do
+            cp "incoming/part-$i" "sealed/aspire-macos-matrix-v7-overlay.enc.b64.part-$i"
+          done
+          git config user.name zerodaybugs
+          git config user.email 80965714+zerodaybugs@users.noreply.github.com
+          git add sealed/aspire-macos-matrix-v7-overlay.enc.b64.part-*
+          git commit -m 'add verified encrypted Aspire v7 overlay parts'
+          git push origin HEAD:main
