@@ -1,0 +1,75 @@
+name: diasym-x86-encrypted-v2-20261126
+
+on:
+  push:
+    branches:
+      - research/diasym-x86-encrypted-20261126
+    paths:
+      - '.github/workflows/diasym-x86-encrypted-v2-20261126.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  x86-cleanroom-v2:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Normalize harness and execute audited encrypted driver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = Join-Path $env:GITHUB_WORKSPACE 'research\diasym-x86\x86_hook_harness.c'
+          $text = [IO.File]::ReadAllText($source).Replace("`r`n", "`n")
+          [IO.File]::WriteAllText($source, $text, [Text.UTF8Encoding]::new($false))
+          $sourceHash = (Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sourceHash -ne '8a3ed7fb632ef9356b263ae458e43d5c232bdb87fcd03a5616c3133e43af1c2b') {
+            throw "normalized source hash mismatch: $sourceHash"
+          }
+
+          $driverFile = Join-Path $env:GITHUB_WORKSPACE '.github\workflows\diasym-x86-encrypted-20261126.yml'
+          $lines = [IO.File]::ReadAllLines($driverFile)
+          $targetName = '      - name: Run encrypted x86 clean-room lane'
+          $targetIndex = [Array]::IndexOf($lines, $targetName)
+          if ($targetIndex -lt 0) { throw 'audited driver step not found' }
+          $runIndex = -1
+          for ($i = $targetIndex + 1; $i -lt $lines.Length; $i++) {
+            if ($lines[$i] -eq '        run: |') { $runIndex = $i; break }
+          }
+          if ($runIndex -lt 0) { throw 'audited driver run block not found' }
+          $stopIndex = -1
+          for ($i = $runIndex + 1; $i -lt $lines.Length; $i++) {
+            if ($lines[$i] -eq '      - name: Upload encrypted result') { $stopIndex = $i; break }
+          }
+          if ($stopIndex -lt 0) { throw 'audited driver block terminator not found' }
+
+          $scriptLines = [Collections.Generic.List[string]]::new()
+          for ($i = $runIndex + 1; $i -lt $stopIndex; $i++) {
+            $line = $lines[$i]
+            if ($line.StartsWith('          ')) {
+              $scriptLines.Add($line.Substring(10))
+            } elseif ([string]::IsNullOrWhiteSpace($line)) {
+              $scriptLines.Add('')
+            } else {
+              throw "unexpected indentation in audited driver at line $($i + 1)"
+            }
+          }
+          $driver = Join-Path $env:RUNNER_TEMP 'diasym-x86-audited-driver.ps1'
+          [IO.File]::WriteAllLines($driver, $scriptLines, [Text.UTF8Encoding]::new($false))
+          $driverHash = (Get-FileHash $driver -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host 'AUDITED_DRIVER_EXTRACTION_PASS'
+          Write-Host "DRIVER_SHA256=$driverHash"
+          & pwsh -NoLogo -NoProfile -NonInteractive -File $driver
+          if ($LASTEXITCODE -ne 0) { throw "audited driver exited with $LASTEXITCODE" }
+
+      - name: Upload encrypted result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diasym-x86-encrypted-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: encrypted-artifact
+          if-no-files-found: error
+          retention-days: 1
