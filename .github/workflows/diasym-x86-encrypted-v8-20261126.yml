@@ -1,0 +1,100 @@
+name: diasym-x86-encrypted-v8-20261126
+
+on:
+  push:
+    branches:
+      - research/diasym-x86-encrypted-20261126
+    paths:
+      - '.github/workflows/diasym-x86-encrypted-v8-20261126.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  x86-cleanroom-v8:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Repair and verify exact harness source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = Join-Path $env:GITHUB_WORKSPACE 'research\diasym-x86\x86_hook_harness.c'
+          $lines = [IO.File]::ReadAllLines($source)
+          if ($lines.Length -ne 254) { throw "unexpected source line count: $($lines.Length)" }
+          $lines[21] = 'typedef HRESULT (STDMETHODCALLTYPE *DocGetSourceLength_fn)(void*, ULONG*);'
+          $lines[22] = 'typedef HRESULT (STDMETHODCALLTYPE *DocGetSourceRange_fn)(void*, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG*, BYTE*);'
+          $lines[146] = '    wprintf(L"DOC[%lu].METHOD token_hr=0x%08lX token=0x%08lX\\n",docIndex,(unsigned long)hr,token);'
+          $lines[151] = '    ULONG offsets[2]={0,C}, sl[2]={0,C}, sc[2]={0,C}, el[2]={0,C}, ec[2]={0,C}; void* spdocs[2]={NULL,P}; ULONG fetched=0;'
+          $lines[159] = '      wprintf(L"DOC[%lu].SP_ALL hr=0x%08lX fetched=%lu requested=%lu\\n",docIndex,(unsigned long)hr,all,count);'
+          [IO.File]::WriteAllText($source, ([string]::Join("`n", $lines) + "`n"), [Text.UTF8Encoding]::new($false))
+          $sourceHash = (Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sourceHash -ne '8a3ed7fb632ef9356b263ae458e43d5c232bdb87fcd03a5616c3133e43af1c2b') { throw "repaired source hash mismatch: $sourceHash" }
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'diasym-x86\work') | Out-Null
+          Write-Host 'EXACT_HARNESS_REPAIR_PASS'
+
+      - name: Configure i686 MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          update: true
+          install: mingw-w64-i686-gcc
+
+      - name: Compile exact x86 harness
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          src="$(cygpath -u "$GITHUB_WORKSPACE")/research/diasym-x86/x86_hook_harness.c"
+          out="$(cygpath -u "$RUNNER_TEMP")/diasym-x86/work/x86_hook_harness.exe"
+          /mingw32/bin/gcc -std=c11 -O0 -Wall -Wextra -municode "$src" -o "$out" -lole32 -lshlwapi -luuid
+          test -s "$out"
+          sha256sum "$src" "$out"
+          echo 'I686_COMPILE_PASS'
+
+      - name: Execute audited encrypted driver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $driverFile = Join-Path $env:GITHUB_WORKSPACE '.github\workflows\diasym-x86-encrypted-20261126.yml'
+          $driverLines = [IO.File]::ReadAllLines($driverFile)
+          $targetIndex = [Array]::IndexOf($driverLines, '      - name: Run encrypted x86 clean-room lane')
+          if ($targetIndex -lt 0) { throw 'audited driver step not found' }
+          $runIndex = -1
+          for ($i = $targetIndex + 1; $i -lt $driverLines.Length; $i++) { if ($driverLines[$i] -eq '        run: |') { $runIndex = $i; break } }
+          if ($runIndex -lt 0) { throw 'audited driver run block not found' }
+          $stopIndex = -1
+          for ($i = $runIndex + 1; $i -lt $driverLines.Length; $i++) { if ($driverLines[$i] -eq '      - name: Upload encrypted result') { $stopIndex = $i; break } }
+          if ($stopIndex -lt 0) { throw 'audited driver block terminator not found' }
+          $scriptLines = [Collections.Generic.List[string]]::new()
+          for ($i = $runIndex + 1; $i -lt $stopIndex; $i++) {
+            $line = $driverLines[$i]
+            if ($line.StartsWith('          ')) { $scriptLines.Add($line.Substring(10)) }
+            elseif ([string]::IsNullOrWhiteSpace($line)) { $scriptLines.Add('') }
+            else { throw "unexpected indentation in audited driver at line $($i + 1)" }
+          }
+          $pacmanLine = -1
+          $compileLine = -1
+          for ($i = 0; $i -lt $scriptLines.Count; $i++) {
+            if ($scriptLines[$i].Contains('$pacman = Start-Process -FilePath $bash')) { $pacmanLine = $i }
+            if ($scriptLines[$i].Contains('$compile = Start-Process -FilePath $gcc')) { $compileLine = $i }
+          }
+          if ($pacmanLine -lt 0 -or $compileLine -lt 0) { throw 'driver patch point missing' }
+          $scriptLines[$pacmanLine] = '    $pacman = [pscustomobject]@{ ExitCode = 0 }'
+          $scriptLines[$compileLine] = '    $compile = [pscustomobject]@{ ExitCode = 0 }'
+          $driver = Join-Path $env:RUNNER_TEMP 'diasym-x86-audited-driver.ps1'
+          [IO.File]::WriteAllLines($driver, $scriptLines, [Text.UTF8Encoding]::new($false))
+          Write-Host "DRIVER_SHA256=$((Get-FileHash $driver -Algorithm SHA256).Hash.ToLowerInvariant())"
+          & pwsh -NoLogo -NoProfile -NonInteractive -File $driver
+          if ($LASTEXITCODE -ne 0) { throw "audited driver exited with $LASTEXITCODE" }
+
+      - name: Upload encrypted result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diasym-x86-encrypted-v8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: encrypted-artifact
+          if-no-files-found: error
+          retention-days: 1
