@@ -9,9 +9,11 @@ TEXT_NAMES = {
     'aspire-hosting-loaded.sha256','aspire-hosting-before-replacement.sha256','exported-stock-dll.sha256',
     'patched-hashes.txt','PATCH_CHAIN.json','V13_PATCH_MANIFEST.json','HARNESS_FINAL_PATCH.json',
     'executed-run-hashes.txt','matrix-summary.json','victim-pids.txt','victim-pid-log-stat.txt',
-    'fix-build-status.txt','revert-status.txt','metadata.txt'
+    'fix-build-status.txt','revert-status.txt','metadata.txt','dcp-services.json','dcp-tunnels.json',
+    'capture-meta.json','attacker-container-inspect.json','build.log','dotnet-lane.txt','runner-provenance.txt',
+    'dotnet-info.txt','dotnet-list-sdks.txt','dotnet-list-runtimes.txt','docker-version.txt','uname.txt','sw_vers.txt'
 }
-IMAGE_RE = re.compile(r'(?i)(dashboard|attacker|replay|resource|linked|lifecycle).+\.(png|jpg|jpeg)$')
+IMAGE_RE = re.compile(r'(?i).*(dashboard|attacker|replay|resource|linked|lifecycle).*\.(png|jpg|jpeg)$')
 TOKEN_PATTERNS = [
     (re.compile(r'([?&](?:t|token|access_token|code)=)[^&\s"\']+', re.I), r'\1<REDACTED>'),
     (re.compile(r'(?im)^((?:authorization|proxy-authorization)\s*:\s*).+$'), r'\1<REDACTED>'),
