@@ -1,0 +1,47 @@
+name: Fix Aspire v13 workflow heredoc indentation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-fix-aspire-v13-workflow-indent-20261126.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Apply exact one-block indentation fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=.github/workflows/_temporary-aspire-cve120006-macos-matrix-v13-ui-lifecycle-20261126.yml
+          python3 - "$target" <<'PY'
+          from pathlib import Path
+          import sys
+          p=Path(sys.argv[1])
+          s=p.read_text()
+          start=s.index("          python3 - \"$PATCH_CHAIN\" \"$PATCH_MANIFEST\" \"$PATCHED_RUN_SHA\" \"$PATCHED_BROWSER_SHA\" <<'PY_MANIFEST'\n")
+          body_start=start+s[start:].index('\n')+1
+          end=s.index('\nPY_MANIFEST\n',body_start)
+          body=s[body_start:end]
+          lines=body.splitlines()
+          assert lines[0]=='import json,sys'
+          assert lines[-1].startswith("assert manifest['navigation']")
+          body='\n'.join('          '+line for line in lines)
+          fixed=s[:body_start]+body+'\n          PY_MANIFEST'+s[end+len('\nPY_MANIFEST'):]
+          p.write_text(fixed)
+          PY
+          test "$(sha256sum "$target" | awk '{print $1}')" = "3ba8ccba327794be456da45cc3765388899a05974c3790e795a63ab06a478974"
+          git config user.name zerodaybugs
+          git config user.email 80965714+zerodaybugs@users.noreply.github.com
+          git add "$target"
+          git diff --cached --check
+          git commit -m 'fix Aspire v13 workflow heredoc indentation'
+          git push origin HEAD:main
