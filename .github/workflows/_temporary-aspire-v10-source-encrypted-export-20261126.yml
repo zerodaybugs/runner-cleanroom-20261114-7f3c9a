@@ -1,0 +1,112 @@
+name: Export Aspire v10 harness encrypted to local audit key
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v10-source-encrypted-export-20261126.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout sealed inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Decrypt v10 overlay and re-encrypt to temporary audit key
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$WRAPPING_KEY_B64"
+          meta_get() {
+            awk -F= -v key="$1" '$1 == key { print substr($0, index($0, "=") + 1); exit }' sealed/aspire-macos-matrix-v10-selfcontained-overlay.metadata
+          }
+
+          printf '%s' "$WRAPPING_KEY_B64" | openssl base64 -d -A > wrapping.key
+          test "$(wc -c < wrapping.key | tr -d ' ')" = "32"
+          WRAP_KEY_HEX="$(od -An -tx1 -v wrapping.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$WRAP_KEY_HEX" \
+            -iv "$(tr -d '\r\n ' < bootstrap/private.iv.hex)" \
+            -in bootstrap/private.pem.enc -out repo-private.pem
+
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v10-selfcontained-overlay.enc.b64 > overlay.enc.b64.norm
+          test "$(sha256sum overlay.enc.b64.norm | awk '{print $1}')" = "$(meta_get OVERLAY_B64_NORMALIZED_SHA256)"
+          openssl base64 -d -A -in overlay.enc.b64.norm -out overlay.enc
+          test "$(sha256sum overlay.enc | awk '{print $1}')" = "$(meta_get OVERLAY_CIPHER_SHA256)"
+
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v10-selfcontained-overlay.key.enc.b64 | openssl base64 -d -A > overlay.key.enc
+          test "$(sha256sum overlay.key.enc | awk '{print $1}')" = "$(meta_get OVERLAY_KEY_CIPHER_SHA256)"
+          openssl pkeyutl -decrypt -inkey repo-private.pem -in overlay.key.enc -out overlay.key \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          test "$(wc -c < overlay.key | tr -d ' ')" = "32"
+
+          KEY_HEX="$(od -An -tx1 -v overlay.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$KEY_HEX" -iv "$(meta_get OVERLAY_IV_HEX)" \
+            -in overlay.enc -out overlay.zip
+          test "$(sha256sum overlay.zip | awk '{print $1}')" = "$(meta_get OVERLAY_PLAIN_SHA256)"
+          mkdir overlay
+          unzip -q overlay.zip -d overlay
+          ROOT=overlay/aspire-macos-matrix-v10-selfcontained
+          test "$(sha256sum "$ROOT/run.sh" | awk '{print $1}')" = "$(meta_get RUN_SH_SHA256)"
+          test "$(sha256sum "$ROOT/browser.js" | awk '{print $1}')" = "$(meta_get BROWSER_JS_SHA256)"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED
+          root=Path('overlay/aspire-macos-matrix-v10-selfcontained')
+          with ZipFile('source.zip','w',compression=ZIP_DEFLATED,compresslevel=9) as z:
+              for name in ['run.sh','browser.js']:
+                  p=root/name
+                  zi=ZipInfo(name,date_time=(2026,11,26,0,0,0))
+                  zi.compress_type=ZIP_DEFLATED
+                  zi.external_attr=(0o700 if name=='run.sh' else 0o600)<<16
+                  z.writestr(zi,p.read_bytes())
+          PY
+          SOURCE_SHA="$(sha256sum source.zip | awk '{print $1}')"
+          RUN_SHA="$(sha256sum "$ROOT/run.sh" | awk '{print $1}')"
+          BROWSER_SHA="$(sha256sum "$ROOT/browser.js" | awk '{print $1}')"
+
+          cat > audit-public.pem <<'EOF_PUB'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA47Lplx2PiuuEZkobudl0
+          4NpyQ8C1F9cnWjroKG3SEORNtYSWxDmVumsGfmyDFwkeLdOarJbTAABjgLHKxzD5
+          QtBQyrEzf+yxidG8Q9uF5D5f0ZkoxIvL5hjvaMsYsUIbiGOUyEETb3zzlDeJAiTO
+          G6IJKf01SYic1qqVq2YrK/LstS4Bybi+1SbLmu/cq8VAS4khIsjAhY0t1eG9+NRA
+          IG6RMTWNgVM4wziq06PpbhOxaHR69izIP6oYs7mBzL+leq12I1Sms3a5IbkThpga
+          ieMPVbUA8ErpnIjuQGJhYyOW+EmGpgJhqhITpy4poltnfFWCJh2QzesQTOV/q6Ii
+          fCrZj8odqfcb3abw1QzaVAKiULsBukWSGgKyLOPrAGlWNXUEiF54m+wSVR4AZn7P
+          etA8rNJV5LjDwEfHNq7VMGc2YHKAiVICAMWIPvNOh/5ECLG+qXinCkwX3KiaJaeL
+          L27Q6wdLpKO0mTiLASDRuiaf+a202YEYpooMcsBHQHuJAgMBAAE=
+          -----END PUBLIC KEY-----
+          EOF_PUB
+          openssl rand 32 > export.key
+          openssl rand 16 > export.iv
+          EXPORT_KEY_HEX="$(od -An -tx1 -v export.key | tr -d ' \n')"
+          EXPORT_IV_HEX="$(od -An -tx1 -v export.iv | tr -d ' \n')"
+          openssl enc -aes-256-cbc -K "$EXPORT_KEY_HEX" -iv "$EXPORT_IV_HEX" -in source.zip -out source.enc
+          openssl pkeyutl -encrypt -pubin -inkey audit-public.pem -in export.key -out export.key.enc \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+
+          echo "EXPORT_SOURCE_SHA256=$SOURCE_SHA"
+          echo "EXPORT_RUN_SHA256=$RUN_SHA"
+          echo "EXPORT_BROWSER_SHA256=$BROWSER_SHA"
+          echo "EXPORT_CIPHER_SHA256=$(sha256sum source.enc | awk '{print $1}')"
+          echo "EXPORT_KEY_CIPHER_SHA256=$(sha256sum export.key.enc | awk '{print $1}')"
+          echo "EXPORT_IV_HEX=$EXPORT_IV_HEX"
+          echo 'BEGIN_EXPORT_CIPHER_B64'
+          openssl base64 -A -in source.enc
+          echo
+          echo 'END_EXPORT_CIPHER_B64'
+          echo 'BEGIN_EXPORT_KEY_B64'
+          openssl base64 -A -in export.key.enc
+          echo
+          echo 'END_EXPORT_KEY_B64'
+
+          rm -rf wrapping.key repo-private.pem overlay.enc.b64.norm overlay.enc overlay.key.enc overlay.key overlay.zip overlay source.zip audit-public.pem export.key export.iv source.enc export.key.enc
