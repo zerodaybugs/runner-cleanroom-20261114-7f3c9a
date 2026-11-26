@@ -1,0 +1,162 @@
+name: Aspire v13 patch-chain compile gate
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v13-compile-gate-20261126.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout sealed clean-room inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install exact .NET SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 10.0.404
+          cache: false
+
+      - name: Decrypt, apply, verify, and compile
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+          DOTNET_NOLOGO: '1'
+          DOTNET_MULTILEVEL_LOOKUP: '0'
+        run: |
+          set -euo pipefail
+          test -n "$WRAPPING_KEY_B64"
+
+          meta_get() {
+            awk -F= -v key="$1" '$1 == key { print substr($0, index($0, "=") + 1); exit }' sealed/aspire-macos-matrix-v10-selfcontained-overlay.metadata
+          }
+          patch_get() {
+            awk -F= -v key="$1" '$1 == key { print substr($0, index($0, "=") + 1); exit }' sealed/aspire-v13-combined-patch.metadata
+          }
+
+          printf '%s' "$WRAPPING_KEY_B64" | openssl base64 -d -A > wrapping.key
+          test "$(wc -c < wrapping.key | tr -d ' ')" = 32
+          WRAP_KEY_HEX="$(od -An -tx1 -v wrapping.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$WRAP_KEY_HEX" \
+            -iv "$(tr -d '\r\n ' < bootstrap/private.iv.hex)" \
+            -in bootstrap/private.pem.enc -out private.pem
+
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v10-selfcontained-overlay.enc.b64 > overlay.enc.b64.norm
+          test "$(sha256sum overlay.enc.b64.norm | awk '{print $1}')" = "$(meta_get OVERLAY_B64_NORMALIZED_SHA256)"
+          openssl base64 -d -A -in overlay.enc.b64.norm -out overlay.enc
+          test "$(sha256sum overlay.enc | awk '{print $1}')" = "$(meta_get OVERLAY_CIPHER_SHA256)"
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v10-selfcontained-overlay.key.enc.b64 | openssl base64 -d -A > overlay.key.enc
+          test "$(sha256sum overlay.key.enc | awk '{print $1}')" = "$(meta_get OVERLAY_KEY_CIPHER_SHA256)"
+          openssl pkeyutl -decrypt -inkey private.pem -in overlay.key.enc -out overlay.key \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          test "$(wc -c < overlay.key | tr -d ' ')" = 32
+          OVERLAY_KEY_HEX="$(od -An -tx1 -v overlay.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$OVERLAY_KEY_HEX" -iv "$(meta_get OVERLAY_IV_HEX)" \
+            -in overlay.enc -out overlay.zip
+          test "$(sha256sum overlay.zip | awk '{print $1}')" = "$(meta_get OVERLAY_PLAIN_SHA256)"
+          test "$(unzip -Z1 overlay.zip | sort | tr '\n' '|')" = "aspire-macos-matrix-v10-selfcontained/browser.js|aspire-macos-matrix-v10-selfcontained/run.sh|"
+          mkdir overlay
+          unzip -q overlay.zip -d overlay
+          BASE=overlay/aspire-macos-matrix-v10-selfcontained
+          test "$(sha256sum "$BASE/run.sh" | awk '{print $1}')" = "$(meta_get RUN_SH_SHA256)"
+          test "$(sha256sum "$BASE/browser.js" | awk '{print $1}')" = "$(meta_get BROWSER_JS_SHA256)"
+
+          cat sealed/aspire-v13-combined-patch.enc.b64.part-* | tr -d '\r\n ' > patch.enc.b64.norm
+          test "$(sha256sum patch.enc.b64.norm | awk '{print $1}')" = "$(patch_get PATCH_B64_NORMALIZED_SHA256)"
+          openssl base64 -d -A -in patch.enc.b64.norm -out patch.enc
+          test "$(sha256sum patch.enc | awk '{print $1}')" = "$(patch_get PATCH_CIPHER_SHA256)"
+          tr -d '\r\n ' < sealed/aspire-v13-combined-patch.key.enc.b64 | openssl base64 -d -A > patch.key.enc
+          test "$(sha256sum patch.key.enc | awk '{print $1}')" = "$(patch_get PATCH_KEY_CIPHER_SHA256)"
+          openssl pkeyutl -decrypt -inkey private.pem -in patch.key.enc -out patch.key \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          test "$(wc -c < patch.key | tr -d ' ')" = 32
+          PATCH_KEY_HEX="$(od -An -tx1 -v patch.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$PATCH_KEY_HEX" -iv "$(patch_get PATCH_IV_HEX)" \
+            -in patch.enc -out patch.zip
+          test "$(sha256sum patch.zip | awk '{print $1}')" = "$(patch_get PATCH_PLAIN_SHA256)"
+          test "$(unzip -Z1 patch.zip | sort | tr '\n' '|')" = "aspire-v13-combined-patch/PATCH_CHAIN.json|aspire-v13-combined-patch/patch-v11.py|aspire-v13-combined-patch/patch-v13.py|"
+          mkdir patch
+          unzip -q patch.zip -d patch
+          PATCHROOT=patch/aspire-v13-combined-patch
+          test "$(sha256sum "$PATCHROOT/patch-v11.py" | awk '{print $1}')" = "$(patch_get PATCH_V11_PY_SHA256)"
+          test "$(sha256sum "$PATCHROOT/patch-v13.py" | awk '{print $1}')" = "$(patch_get PATCH_V13_PY_SHA256)"
+          test "$(sha256sum "$PATCHROOT/PATCH_CHAIN.json" | awk '{print $1}')" = "$(patch_get PATCH_CHAIN_SHA256)"
+
+          python3 "$PATCHROOT/patch-v11.py" "$BASE" patched-v11
+          test "$(sha256sum patched-v11/run.sh | awk '{print $1}')" = "$(patch_get V11_RUN_SHA256)"
+          test "$(sha256sum patched-v11/browser.js | awk '{print $1}')" = "$(patch_get V11_BROWSER_SHA256)"
+          python3 "$PATCHROOT/patch-v13.py" patched-v11 patched-v13
+          test "$(sha256sum patched-v13/run.sh | awk '{print $1}')" = "$(patch_get FINAL_RUN_SHA256)"
+          test "$(sha256sum patched-v13/browser.js | awk '{print $1}')" = "$(patch_get FINAL_BROWSER_SHA256)"
+          bash -n patched-v13/run.sh
+          node --check patched-v13/browser.js
+
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('patched-v13/run.sh').read_text()
+          required=[
+              'attacker.WithUrlForEndpoint("https", url => url.DisplayText = "Attacker linked HTTPS");',
+              'var victim = builder.AddExecutable("victim", "/bin/sh", ".")',
+              '.WithArgs("-c", "echo \\$\\$ >>',
+          ]
+          for x in required:
+              assert x in s, x
+          PY
+
+          for version in 13.6.5 17.0.0; do
+            dir="compile-$version"
+            mkdir -p "$dir/Properties"
+            cat > "$dir/global.json" <<'EOF'
+          {"sdk":{"version":"10.0.404","rollForward":"disable","allowPrerelease":false}}
+          EOF
+            if [[ "$version" == 13.* ]]; then
+              cat > "$dir/AppHost.csproj" <<EOF
+          <Project Sdk="Aspire.AppHost.Sdk/$version">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
+              <AspireUseCliBundle>true</AspireUseCliBundle>
+            </PropertyGroup>
+          </Project>
+          EOF
+            else
+              cat > "$dir/AppHost.csproj" <<EOF
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="Aspire.Hosting.AppHost" Version="$version" />
+              <PackageReference Include="Aspire.Hosting.Dotnet" Version="$version" />
+            </ItemGroup>
+          </Project>
+          EOF
+            fi
+            cat > "$dir/AppHost.cs" <<'EOF'
+          var builder = DistributedApplication.CreateBuilder(args);
+          builder.Configuration["ASPIRE_ENABLE_CONTAINER_TUNNEL"] = "false";
+          var attacker = builder.AddContainer("attacker", "attacker-https", "local")
+              .WithHttpsEndpoint(port: 19991, targetPort: 8443, name: "https")
+              .WithHttpEndpoint(port: 19992, targetPort: 8888, name: "proxy")
+              .WithExternalHttpEndpoints();
+          attacker.WithUrlForEndpoint("https", url => url.DisplayText = "Attacker linked HTTPS");
+          attacker.WithOtlpExporter();
+          var victim = builder.AddExecutable("victim", "/bin/sh", ".")
+              .WithArgs("-c", "echo $$ >> '/tmp/aspire-v13-compile-pids'; exec /bin/sleep 86400");
+          builder.Build().Run();
+          EOF
+            echo "=== BUILD $version ==="
+            (cd "$dir" && dotnet restore -v:minimal && dotnet build --no-restore -v:minimal)
+            sha256sum "$dir/bin/Debug/net10.0/Aspire.Hosting.dll" "$dir/bin/Debug/net10.0/AppHost.dll"
+          done
+
+          dotnet --info
+          dotnet --list-sdks
+          dotnet --list-runtimes
+          echo COMPILE_GATE=PASS
