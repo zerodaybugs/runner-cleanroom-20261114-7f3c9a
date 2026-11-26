@@ -1,0 +1,273 @@
+name: diasym-x86-encrypted-20261126
+
+on:
+  push:
+    branches:
+      - research/diasym-x86-encrypted-20261126
+    paths:
+      - '.github/workflows/diasym-x86-encrypted-20261126.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  x86-cleanroom:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run encrypted x86 clean-room lane
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $root = Join-Path $env:RUNNER_TEMP 'diasym-x86'
+          $work = Join-Path $root 'work'
+          $private = Join-Path $root 'private'
+          $artifact = Join-Path $env:GITHUB_WORKSPACE 'encrypted-artifact'
+          New-Item -ItemType Directory -Force -Path $work,$private,$artifact | Out-Null
+          $driverLog = Join-Path $private 'driver.log'
+          $driverStatus = 'unknown'
+
+          function Add-PrivateLog([string]$Text) {
+            Add-Content -LiteralPath $driverLog -Value $Text -Encoding UTF8
+          }
+
+          function Get-VerifiedFile([string]$Url,[string]$Path,[string]$Algorithm,[string]$Expected) {
+            Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing
+            $actual = (Get-FileHash -LiteralPath $Path -Algorithm $Algorithm).Hash.ToLowerInvariant()
+            if ($actual -ne $Expected.ToLowerInvariant()) {
+              throw "hash mismatch for $Path expected=$Expected actual=$actual"
+            }
+            Add-PrivateLog "verified $Algorithm $actual $Path"
+          }
+
+          function Get-ProbeSummary([string]$Text) {
+            $matches = [regex]::Matches($Text, 'HOOK_PROBE hit=(\d+) ok=(\d+) reported=(\d+) line_oob_bytes=(\d+).*?col_oob_bytes=(\d+)')
+            $rows = @()
+            foreach ($m in $matches) {
+              $rows += [ordered]@{
+                hit = [int]$m.Groups[1].Value
+                ok = [int]$m.Groups[2].Value
+                reported = [uint32]$m.Groups[3].Value
+                line_oob_bytes = [uint64]$m.Groups[4].Value
+                col_oob_bytes = [uint64]$m.Groups[5].Value
+              }
+            }
+            return ,$rows
+          }
+
+          function Run-Case([string]$Name,[string]$Harness,[string]$CoreClr,[string]$Reader,[string]$Assembly,[string]$Pdb,[string]$Rva) {
+            $stdout = Join-Path $private "$Name.stdout.txt"
+            $stderr = Join-Path $private "$Name.stderr.txt"
+            $args = @($CoreClr,$Reader,$Assembly,$Pdb,'deep',$Rva)
+            $p = Start-Process -FilePath $Harness -ArgumentList $args -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -NoNewWindow
+            $timedOut = -not $p.WaitForExit(60000)
+            if ($timedOut) {
+              try { $p.Kill($true) } catch {}
+              $exitCode = $null
+            } else {
+              $exitCode = $p.ExitCode
+            }
+            $outText = if (Test-Path $stdout) { Get-Content -LiteralPath $stdout -Raw } else { '' }
+            $errText = if (Test-Path $stderr) { Get-Content -LiteralPath $stderr -Raw } else { '' }
+            $probes = @(Get-ProbeSummary $outText)
+            $oob = $false
+            foreach ($row in $probes) {
+              if (($row.line_oob_bytes -gt 0) -or ($row.col_oob_bytes -gt 0)) { $oob = $true }
+            }
+            return [ordered]@{
+              name = $Name
+              exit_code = $exitCode
+              timed_out = $timedOut
+              harness_pass = $outText.Contains('RAW_HARNESS_PASS')
+              hook_installed = $outText.Contains('HOOK_INSTALLED')
+              canary_corruption = $outText.Contains('CANARY_CORRUPTION')
+              private_probe_oob = $oob
+              probes = $probes
+              stdout_sha256 = if (Test-Path $stdout) { (Get-FileHash $stdout -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
+              stderr_sha256 = if (Test-Path $stderr) { (Get-FileHash $stderr -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
+              reader_sha256 = (Get-FileHash $Reader -Algorithm SHA256).Hash.ToLowerInvariant()
+              pdb_sha256 = (Get-FileHash $Pdb -Algorithm SHA256).Hash.ToLowerInvariant()
+              rva = $Rva
+              stderr_nonempty = ($errText.Length -gt 0)
+            }
+          }
+
+          try {
+            Add-PrivateLog "run_id=$env:GITHUB_RUN_ID attempt=$env:GITHUB_RUN_ATTEMPT sha=$env:GITHUB_SHA"
+            Add-PrivateLog "os=$([Environment]::OSVersion.VersionString) arch=$env:PROCESSOR_ARCHITECTURE"
+
+            New-Item -ItemType Directory -Force -Path 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting' | Out-Null
+            Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting' -Name DontShowUI -Type DWord -Value 1
+            Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting' -Name Disabled -Type DWord -Value 1
+
+            $runtimeZip = Join-Path $work 'dotnet-runtime-10.0.15-win-x86.zip'
+            Get-VerifiedFile `
+              'https://builds.dotnet.microsoft.com/dotnet/Runtime/10.0.15/dotnet-runtime-10.0.15-win-x86.zip' `
+              $runtimeZip SHA512 `
+              '184be357a27891e80d57737be8ef4749945ee958e6a3faf7d57b867fc6e1938db3d86c7b525b92393a7ffae3af5322a039410ce71b0a11475cd326fb2fbb903f'
+            $runtime = Join-Path $work 'runtime'
+            Expand-Archive -LiteralPath $runtimeZip -DestinationPath $runtime -Force
+            $coreClr = Join-Path $runtime 'shared\Microsoft.NETCore.App\10.0.15\coreclr.dll'
+            if ((Get-FileHash $coreClr -Algorithm SHA256).Hash.ToLowerInvariant() -ne '825e62eb5412565b1f3239d4828cf4fbd0dd68509820e26a0948fbbab22da41c') {
+              throw 'coreclr hash mismatch'
+            }
+
+            foreach ($version in @('10.0.14','10.0.15')) {
+              $pkg = Join-Path $work "runtime-$version.nupkg"
+              Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.netcore.app.runtime.win-x86/$version/microsoft.netcore.app.runtime.win-x86.$version.nupkg" -OutFile $pkg -UseBasicParsing
+              $zip = Join-Path $work "runtime-$version.zip"
+              Copy-Item $pkg $zip
+              $dest = Join-Path $work $version
+              Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+              Add-PrivateLog "nupkg $version sha256=$((Get-FileHash $pkg -Algorithm SHA256).Hash.ToLowerInvariant())"
+            }
+            $readerVuln = Join-Path $work '10.0.14\runtimes\win-x86\native\Microsoft.DiaSymReader.Native.x86.dll'
+            $readerFixed = Join-Path $work '10.0.15\runtimes\win-x86\native\Microsoft.DiaSymReader.Native.x86.dll'
+            if ((Get-FileHash $readerVuln -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'cb10c46eef14b8aedb8b8e048193dbcd502f038bfa1d959a5035fa30254c5d68') { throw 'vulnerable reader hash mismatch' }
+            if ((Get-FileHash $readerFixed -Algorithm SHA256).Hash.ToLowerInvariant() -ne '34328fbc265b5ffc58147fdfb7b181bbec71071d56634ae5db50136c59d961e9') { throw 'fixed reader hash mismatch' }
+
+            $fixtureDll = Join-Path $work 'SourceLink.dll'
+            $fixturePdb = Join-Path $work 'SourceLink.pdb'
+            Get-VerifiedFile `
+              'https://raw.githubusercontent.com/dotnet/symreader/d598569d63dfba306a5a10a68d0c566cc2a7440d/src/PdbTestResources/Resources/SourceLink.dll' `
+              $fixtureDll SHA256 `
+              '38405c39b479cfe48dd25898e05d3e45e4dc1b1ce197ce7987750ca82da40909'
+            Get-VerifiedFile `
+              'https://raw.githubusercontent.com/dotnet/symreader/d598569d63dfba306a5a10a68d0c566cc2a7440d/src/PdbTestResources/Resources/SourceLink.pdb' `
+              $fixturePdb SHA256 `
+              'b45400023cb676cd21caf0834c5e307f5c362352ff1834b543a787bfa5acfc59'
+
+            $triggerPdb = Join-Path $work 'SourceLink.reloc1.pdb'
+            $pdbBytes = [IO.File]::ReadAllBytes($fixturePdb)
+            $originalReloc = [BitConverter]::ToUInt32($pdbBytes,12436)
+            if ($originalReloc -ne 0) { throw "unexpected original relocation offset $originalReloc" }
+            [Array]::Copy([BitConverter]::GetBytes([uint32]1),0,$pdbBytes,12436,4)
+            [IO.File]::WriteAllBytes($triggerPdb,$pdbBytes)
+            Add-PrivateLog "trigger_pdb_sha256=$((Get-FileHash $triggerPdb -Algorithm SHA256).Hash.ToLowerInvariant())"
+
+            $source = Join-Path $env:GITHUB_WORKSPACE 'research\diasym-x86\x86_hook_harness.c'
+            if ((Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant() -ne '8a3ed7fb632ef9356b263ae458e43d5c232bdb87fcd03a5616c3133e43af1c2b') { throw 'harness source hash mismatch' }
+            $bash = 'C:\msys64\usr\bin\bash.exe'
+            $pacmanOut = Join-Path $private 'pacman.stdout.txt'
+            $pacmanErr = Join-Path $private 'pacman.stderr.txt'
+            $pacman = Start-Process -FilePath $bash -ArgumentList @('-lc','pacman -Sy --noconfirm --needed mingw-w64-i686-gcc') -RedirectStandardOutput $pacmanOut -RedirectStandardError $pacmanErr -PassThru -NoNewWindow -Wait
+            if ($pacman.ExitCode -ne 0) { throw "pacman failed with $($pacman.ExitCode)" }
+            $gcc = 'C:\msys64\mingw32\bin\gcc.exe'
+            if (-not (Test-Path $gcc)) { throw 'i686 gcc missing after install' }
+            $harness = Join-Path $work 'x86_hook_harness.exe'
+            $compileOut = Join-Path $private 'compile.stdout.txt'
+            $compileErr = Join-Path $private 'compile.stderr.txt'
+            $compileArgs = @('-std=c11','-O0','-Wall','-Wextra','-municode',$source,'-o',$harness,'-lole32','-lshlwapi','-luuid')
+            $compile = Start-Process -FilePath $gcc -ArgumentList $compileArgs -RedirectStandardOutput $compileOut -RedirectStandardError $compileErr -PassThru -NoNewWindow -Wait
+            if ($compile.ExitCode -ne 0) { throw "compile failed with $($compile.ExitCode)" }
+
+            $cases = @()
+            $cases += Run-Case 'fixed-baseline' $harness $coreClr $readerFixed $fixtureDll $fixturePdb '0x17c750'
+            $cases += Run-Case 'vuln-baseline' $harness $coreClr $readerVuln $fixtureDll $fixturePdb '0x17bf60'
+            $cases += Run-Case 'fixed-reloc1' $harness $coreClr $readerFixed $fixtureDll $triggerPdb '0x17c750'
+            $cases += Run-Case 'vuln-reloc1' $harness $coreClr $readerVuln $fixtureDll $triggerPdb '0x17bf60'
+
+            $fixedTrigger = $cases | Where-Object name -eq 'fixed-reloc1'
+            $vulnTrigger = $cases | Where-Object name -eq 'vuln-reloc1'
+            $gate = if ($fixedTrigger.private_probe_oob) {
+              'CURRENT_X86_RESIDUAL_CANDIDATE'
+            } elseif ($vulnTrigger.private_probe_oob -and -not $fixedTrigger.private_probe_oob) {
+              'PATCHED_FAIL_CLOSED_CONTROL_CONFIRMED'
+            } else {
+              'INCONCLUSIVE_NO_EXPECTED_VULN_CONTROL'
+            }
+            [ordered]@{
+              gate = $gate
+              run_id = $env:GITHUB_RUN_ID
+              run_attempt = $env:GITHUB_RUN_ATTEMPT
+              commit = $env:GITHUB_SHA
+              runner = [ordered]@{
+                os = [Environment]::OSVersion.VersionString
+                processor_architecture = $env:PROCESSOR_ARCHITECTURE
+                gcc = (& $gcc --version | Select-Object -First 1)
+              }
+              provenance = [ordered]@{
+                dotnet_runtime = '10.0.15-win-x86'
+                coreclr_sha256 = (Get-FileHash $coreClr -Algorithm SHA256).Hash.ToLowerInvariant()
+                reader_vulnerable_sha256 = (Get-FileHash $readerVuln -Algorithm SHA256).Hash.ToLowerInvariant()
+                reader_fixed_sha256 = (Get-FileHash $readerFixed -Algorithm SHA256).Hash.ToLowerInvariant()
+                fixture_dll_sha256 = (Get-FileHash $fixtureDll -Algorithm SHA256).Hash.ToLowerInvariant()
+                fixture_pdb_sha256 = (Get-FileHash $fixturePdb -Algorithm SHA256).Hash.ToLowerInvariant()
+                trigger_pdb_sha256 = (Get-FileHash $triggerPdb -Algorithm SHA256).Hash.ToLowerInvariant()
+                harness_source_sha256 = (Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant()
+                harness_binary_sha256 = (Get-FileHash $harness -Algorithm SHA256).Hash.ToLowerInvariant()
+              }
+              cases = $cases
+            } | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $private 'summary.json') -Encoding UTF8
+            $driverStatus = 'completed'
+          }
+          catch {
+            $driverStatus = 'driver_error'
+            Add-PrivateLog ($_ | Out-String)
+          }
+          finally {
+            [ordered]@{
+              driver_status = $driverStatus
+              run_id = $env:GITHUB_RUN_ID
+              run_attempt = $env:GITHUB_RUN_ATTEMPT
+              commit = $env:GITHUB_SHA
+            } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $private 'driver-status.json') -Encoding UTF8
+
+            Get-ChildItem -LiteralPath $private -File | ForEach-Object {
+              "{0}  {1}" -f ((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()),$_.Name
+            } | Sort-Object | Set-Content -LiteralPath (Join-Path $private 'SHA256SUMS.txt') -Encoding UTF8
+
+            $plainZip = Join-Path $root 'results.zip'
+            Compress-Archive -Path (Join-Path $private '*') -DestinationPath $plainZip -Force
+            $key = New-Object byte[] 32
+            $iv = New-Object byte[] 16
+            [Security.Cryptography.RandomNumberGenerator]::Fill($key)
+            [Security.Cryptography.RandomNumberGenerator]::Fill($iv)
+            $aes = [Security.Cryptography.Aes]::Create()
+            $aes.KeySize = 256
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $key
+            $aes.IV = $iv
+            $plain = [IO.File]::ReadAllBytes($plainZip)
+            $encryptor = $aes.CreateEncryptor()
+            $cipher = $encryptor.TransformFinalBlock($plain,0,$plain.Length)
+            [IO.File]::WriteAllBytes((Join-Path $artifact 'results.enc'),$cipher)
+
+            $keyIv = New-Object byte[] 48
+            [Array]::Copy($key,0,$keyIv,0,32)
+            [Array]::Copy($iv,0,$keyIv,32,16)
+            $rsa = [Security.Cryptography.RSA]::Create()
+            $rsa.ImportFromPem((Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'research\diasym-x86\result-public.pem') -Raw))
+            $wrapped = $rsa.Encrypt($keyIv,[Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+            [IO.File]::WriteAllBytes((Join-Path $artifact 'key.enc'),$wrapped)
+
+            $publicManifest = [ordered]@{
+              format = 'RSA-OAEP-SHA256 + AES-256-CBC-PKCS7'
+              results_enc_sha256 = (Get-FileHash (Join-Path $artifact 'results.enc') -Algorithm SHA256).Hash.ToLowerInvariant()
+              key_enc_sha256 = (Get-FileHash (Join-Path $artifact 'key.enc') -Algorithm SHA256).Hash.ToLowerInvariant()
+              public_key_sha256 = (Get-FileHash (Join-Path $env:GITHUB_WORKSPACE 'research\diasym-x86\result-public.pem') -Algorithm SHA256).Hash.ToLowerInvariant()
+              run_id = $env:GITHUB_RUN_ID
+              run_attempt = $env:GITHUB_RUN_ATTEMPT
+            }
+            $publicManifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $artifact 'manifest.json') -Encoding UTF8
+            Remove-Item -LiteralPath $plainZip -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $private -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host 'ENCRYPTED_RESEARCH_RUN_COMPLETE'
+            Write-Host "CIPHERTEXT_SHA256=$($publicManifest.results_enc_sha256)"
+            Write-Host "WRAPPED_KEY_SHA256=$($publicManifest.key_enc_sha256)"
+          }
+
+      - name: Upload encrypted result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diasym-x86-encrypted-${{ github.run_id }}-${{ github.run_attempt }}
+          path: encrypted-artifact
+          if-no-files-found: error
+          retention-days: 1
