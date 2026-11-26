@@ -55,7 +55,7 @@ jobs:
           unzip -q evidence.zip -d evidence
           ROOT="$(find evidence -mindepth 1 -maxdepth 1 -type d | head -1)"
           test -n "$ROOT"
-          scripts/aspire-sanitize-evidence.py "$ROOT" safe-forensics
+          python3 scripts/aspire-sanitize-evidence.py "$ROOT" safe-forensics
           cp artifact/metadata.txt safe-forensics/ci-artifact-metadata.txt
           printf '%s  ci-artifact-metadata.txt\n' "$(sha256sum safe-forensics/ci-artifact-metadata.txt | awk '{print $1}')" >> safe-forensics/SHA256SUMS.txt
           rm -rf artifact evidence artifact.zip evidence.zip wrapping.key private.pem payload.key.enc runtime.key
