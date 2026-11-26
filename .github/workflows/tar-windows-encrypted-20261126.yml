@@ -1,0 +1,191 @@
+name: tar-windows-encrypted-20261126
+
+on:
+  push:
+    branches:
+      - research/diasym-x86-encrypted-20261126
+    paths:
+      - '.github/workflows/tar-windows-encrypted-20261126.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tar-containment:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            10.0.404
+            11.0.100
+
+      - name: Run private Windows containment matrix and encrypt result
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $root = Join-Path $env:RUNNER_TEMP 'tar-windows-matrix'
+          $work = Join-Path $root 'work'
+          $private = Join-Path $root 'private'
+          $artifact = Join-Path $env:GITHUB_WORKSPACE 'tar-encrypted-artifact'
+          New-Item -ItemType Directory -Force -Path $work,$private,$artifact | Out-Null
+
+          @'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFrameworks>net10.0;net11.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+</Project>
+'@ | Set-Content -LiteralPath (Join-Path $work 'TarMatrix.csproj') -Encoding UTF8
+
+          @'
+using System.Formats.Tar;
+using System.Security.Cryptography;
+using System.Text.Json;
+
+if (args.Length != 2) throw new ArgumentException("archive destination");
+string archive=Path.GetFullPath(args[0]), dest=Path.GetFullPath(args[1]);
+Directory.CreateDirectory(dest);
+string parent=Path.GetDirectoryName(dest)!;
+var before=Snapshot(parent);
+string? error=null;
+try { TarFile.ExtractToDirectory(archive,dest,overwriteFiles:true); }
+catch(Exception ex){ error=ex.GetType().FullName+":"+ex.Message; }
+var after=Snapshot(parent);
+var changed=after.Where(kv=>!before.TryGetValue(kv.Key,out var old)||old!=kv.Value).ToDictionary();
+Console.WriteLine(JsonSerializer.Serialize(new{archive,dest,error,changed,inside=Snapshot(dest)},new JsonSerializerOptions{WriteIndented=true}));
+
+static Dictionary<string,string> Snapshot(string root)
+{
+    var result=new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);
+    if(!Directory.Exists(root)) return result;
+    var pending=new Stack<string>(); pending.Push(root);
+    while(pending.Count>0)
+    {
+        string current=pending.Pop();
+        foreach(string path in Directory.EnumerateFileSystemEntries(current))
+        {
+            string rel=Path.GetRelativePath(root,path);
+            try
+            {
+                var attr=File.GetAttributes(path);
+                if(attr.HasFlag(FileAttributes.ReparsePoint))
+                {
+                    string? target=Directory.Exists(path)?new DirectoryInfo(path).LinkTarget:new FileInfo(path).LinkTarget;
+                    result[rel]="LINK:"+(target??"?");
+                    continue;
+                }
+                if(File.Exists(path))
+                {
+                    using var stream=File.OpenRead(path);
+                    result[rel]="FILE:"+Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+                }
+                else
+                {
+                    result[rel]="DIR";
+                    pending.Push(path);
+                }
+            }
+            catch(Exception ex){ result[rel]="ERR:"+ex.GetType().Name; }
+        }
+    }
+    return result;
+}
+'@ | Set-Content -LiteralPath (Join-Path $work 'Program.cs') -Encoding UTF8
+
+          @'
+import tarfile,io,json,os,sys
+from pathlib import Path
+out=Path(sys.argv[1]);out.mkdir(parents=True,exist_ok=True)
+def add_file(tf,name,data=b'PWNED_MARKER\n'):
+    ti=tarfile.TarInfo(name);ti.size=len(data);ti.mode=0o644;tf.addfile(ti,io.BytesIO(data))
+def add_link(tf,name,target,hard=False):
+    ti=tarfile.TarInfo(name);ti.type=tarfile.LNKTYPE if hard else tarfile.SYMTYPE;ti.linkname=target;ti.mode=0o777;tf.addfile(ti)
+cases={}
+def case(name,fn):
+    p=out/(name+'.tar')
+    with tarfile.open(p,'w',format=tarfile.PAX_FORMAT) as tf:fn(tf)
+    cases[p.name]=name
+case('symlink_parent_slash',lambda tf:(add_link(tf,'link','../outside'),add_file(tf,'link/pwned.txt')))
+case('symlink_parent_backslash',lambda tf:(add_link(tf,'link','..\\outside'),add_file(tf,'link\\pwned.txt')))
+case('symlink_mixed_child',lambda tf:(add_link(tf,'link','../outside'),add_file(tf,'link\\pwned.txt')))
+case('hard_parent_slash',lambda tf:add_link(tf,'hard','../outside-file',True))
+case('hard_parent_backslash',lambda tf:add_link(tf,'hard','..\\outside-file',True))
+for i,n in enumerate(['../outside.txt','..\\outside-backslash.txt','a/../../outside2.txt','a\\..\\..\\outside3.txt','a/..\\../outside4.txt','a\\../..\\outside5.txt','C:/tar-absolute.txt','C:\\tar-absolute-backslash.txt','\\\\localhost\\C$\\tar-unc.txt','\\\\?\\C:\\tar-nt.txt','inside.txt:alternate']):
+    case(f'path_{i:02d}',lambda tf,n=n:add_file(tf,n))
+case('dir_then_symlink',lambda tf:(tf.addfile(type('T',(tarfile.TarInfo,),{} )('link')),add_link(tf,'link','../outside'),add_file(tf,'link/pwned.txt')))
+(out/'manifest.json').write_text(json.dumps(cases,indent=2))
+'@ | Set-Content -LiteralPath (Join-Path $work 'make_corpus.py') -Encoding UTF8
+
+          python (Join-Path $work 'make_corpus.py') (Join-Path $work 'corpus')
+          dotnet restore (Join-Path $work 'TarMatrix.csproj') --nologo | Out-File (Join-Path $private 'restore.txt')
+          dotnet build (Join-Path $work 'TarMatrix.csproj') -f net10.0 --no-restore --nologo | Out-File (Join-Path $private 'build-net10.txt')
+          dotnet build (Join-Path $work 'TarMatrix.csproj') -f net11.0 --no-restore --nologo | Out-File (Join-Path $private 'build-net11.txt')
+          dotnet --info | Out-File (Join-Path $private 'dotnet-info.txt')
+          dotnet --list-sdks | Out-File (Join-Path $private 'dotnet-sdks.txt')
+          dotnet --list-runtimes | Out-File (Join-Path $private 'dotnet-runtimes.txt')
+
+          $all = @()
+          foreach($tfm in @('net10.0','net11.0'))
+          {
+            $dll = Join-Path $work "bin\Debug\$tfm\TarMatrix.dll"
+            $i=0
+            foreach($archive in Get-ChildItem (Join-Path $work 'corpus') -Filter '*.tar' | Sort-Object Name)
+            {
+              $caseRoot=Join-Path $work ("run-$tfm-{0:D2}" -f $i)
+              $dest=Join-Path $caseRoot 'dest'
+              New-Item -ItemType Directory -Force -Path $caseRoot | Out-Null
+              $raw=& dotnet $dll $archive.FullName $dest
+              $obj=($raw -join "`n") | ConvertFrom-Json -AsHashtable
+              $outside=[ordered]@{}
+              foreach($entry in $obj.changed.GetEnumerator())
+              {
+                if($entry.Key -ne 'dest' -and -not $entry.Key.StartsWith('dest\') -and -not $entry.Key.StartsWith('dest/')) { $outside[$entry.Key]=$entry.Value }
+              }
+              $all += [ordered]@{tfm=$tfm;case=$archive.Name;error=$obj.error;outside=$outside;inside=$obj.inside}
+              Remove-Item $caseRoot -Recurse -Force -ErrorAction SilentlyContinue
+              $i++
+            }
+          }
+          $outsideHits=@($all | Where-Object { $_.outside.Count -gt 0 })
+          [ordered]@{
+            gate = if($outsideHits.Count -gt 0){'WINDOWS_OUTSIDE_WRITE_CANDIDATE'}else{'WINDOWS_CONTAINMENT_FAIL_CLOSED'}
+            run_id=$env:GITHUB_RUN_ID
+            run_attempt=$env:GITHUB_RUN_ATTEMPT
+            os=[Environment]::OSVersion.VersionString
+            results=$all
+            outside_hits=$outsideHits
+          } | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $private 'summary.json') -Encoding UTF8
+
+          Get-ChildItem $private -File | ForEach-Object { "{0}  {1}" -f ((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()),$_.Name } | Sort-Object | Set-Content (Join-Path $private 'SHA256SUMS.txt') -Encoding UTF8
+          $plainZip=Join-Path $root 'results.zip'
+          Compress-Archive -Path (Join-Path $private '*') -DestinationPath $plainZip -Force
+          $key=New-Object byte[] 32;$iv=New-Object byte[] 16
+          [Security.Cryptography.RandomNumberGenerator]::Fill($key);[Security.Cryptography.RandomNumberGenerator]::Fill($iv)
+          $aes=[Security.Cryptography.Aes]::Create();$aes.KeySize=256;$aes.Mode=[Security.Cryptography.CipherMode]::CBC;$aes.Padding=[Security.Cryptography.PaddingMode]::PKCS7;$aes.Key=$key;$aes.IV=$iv
+          $plain=[IO.File]::ReadAllBytes($plainZip);$cipher=$aes.CreateEncryptor().TransformFinalBlock($plain,0,$plain.Length)
+          [IO.File]::WriteAllBytes((Join-Path $artifact 'results.enc'),$cipher)
+          $keyIv=New-Object byte[] 48;[Array]::Copy($key,0,$keyIv,0,32);[Array]::Copy($iv,0,$keyIv,32,16)
+          $rsa=[Security.Cryptography.RSA]::Create();$rsa.ImportFromPem((Get-Content (Join-Path $env:GITHUB_WORKSPACE 'research\diasym-x86\result-public.pem') -Raw)
+          [IO.File]::WriteAllBytes((Join-Path $artifact 'key.enc'),$rsa.Encrypt($keyIv,[Security.Cryptography.RSAEncryptionPadding]::OaepSHA256))
+          [ordered]@{format='RSA-OAEP-SHA256 + AES-256-CBC-PKCS7';results_enc_sha256=(Get-FileHash (Join-Path $artifact 'results.enc') -Algorithm SHA256).Hash.ToLowerInvariant();key_enc_sha256=(Get-FileHash (Join-Path $artifact 'key.enc') -Algorithm SHA256).Hash.ToLowerInvariant();run_id=$env:GITHUB_RUN_ID;run_attempt=$env:GITHUB_RUN_ATTEMPT} | ConvertTo-Json | Set-Content (Join-Path $artifact 'manifest.json') -Encoding UTF8
+          Remove-Item $plainZip -Force
+          Remove-Item $private -Recurse -Force
+          Remove-Item $work -Recurse -Force
+          Write-Host 'ENCRYPTED_TAR_MATRIX_COMPLETE'
+
+      - name: Upload encrypted result
+        uses: actions/upload-artifact@v4
+        with:
+          name: tar-windows-encrypted-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tar-encrypted-artifact
+          if-no-files-found: error
+          retention-days: 1
