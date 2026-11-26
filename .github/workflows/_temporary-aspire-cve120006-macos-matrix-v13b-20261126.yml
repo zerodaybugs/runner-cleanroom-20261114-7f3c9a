@@ -1,4 +1,4 @@
-name: Sealed Aspire CVE-2026-120006 macOS matrix v13b
+name: Sealed Aspire CVE-2026-120006 macOS matrix v14 PTY
 
 on:
   push:
@@ -44,6 +44,152 @@ jobs:
         run: |
           set -euo pipefail
           test "$(shasum -a 256 scripts/aspire-v13-bootstrap.sh | awk '{print $1}')" = "61573c91e0efcf1171ed45481c829c7f2e736b5e789bcb6f6a2335966ac8a99c"
+          cat > /tmp/apply-aspire-pty-harness.py <<'PY_APPLY_PTY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          run_path = pathlib.Path(sys.argv[1])
+          receipt_path = pathlib.Path(sys.argv[2])
+          source = run_path.read_text()
+          before = hashlib.sha256(source.encode()).hexdigest()
+          changes = []
+
+          marker = 'ACTIVE_APPHOST_PID=""\ncleanup_lane() {'
+          replacement = 'ACTIVE_APPHOST_PID=""\nACTIVE_APPHOST_CHILD_PID_FILE=""\ncleanup_lane() {'
+          if source.count(marker) != 1:
+              raise SystemExit(f'active marker count={source.count(marker)}')
+          source = source.replace(marker, replacement, 1)
+          changes.append('track pty child process group')
+
+          old_cleanup = '''  if [[ -n "${ACTIVE_APPHOST_PID:-}" ]]; then
+            kill "$ACTIVE_APPHOST_PID" 2>/dev/null || true
+            for _ in $(seq 1 20); do kill -0 "$ACTIVE_APPHOST_PID" 2>/dev/null || break; sleep 0.1; done
+            kill -9 "$ACTIVE_APPHOST_PID" 2>/dev/null || true
+            wait "$ACTIVE_APPHOST_PID" 2>/dev/null || true
+            ACTIVE_APPHOST_PID=""
+          fi
+          '''
+          new_cleanup = '''  if [[ -n "${ACTIVE_APPHOST_CHILD_PID_FILE:-}" && -f "$ACTIVE_APPHOST_CHILD_PID_FILE" ]]; then
+            local child_pid
+            child_pid="$(cat "$ACTIVE_APPHOST_CHILD_PID_FILE" 2>/dev/null || true)"
+            if [[ "$child_pid" =~ ^[0-9]+$ ]]; then
+              kill -INT "-$child_pid" 2>/dev/null || kill -INT "$child_pid" 2>/dev/null || true
+              for _ in $(seq 1 30); do kill -0 "$child_pid" 2>/dev/null || break; sleep 0.1; done
+              kill -TERM "-$child_pid" 2>/dev/null || kill -TERM "$child_pid" 2>/dev/null || true
+              sleep 0.2
+              kill -KILL "-$child_pid" 2>/dev/null || kill -KILL "$child_pid" 2>/dev/null || true
+            fi
+            rm -f "$ACTIVE_APPHOST_CHILD_PID_FILE"
+            ACTIVE_APPHOST_CHILD_PID_FILE=""
+          fi
+          ''' + old_cleanup
+          if source.count(old_cleanup) != 1:
+              raise SystemExit(f'cleanup marker count={source.count(old_cleanup)}')
+          source = source.replace(old_cleanup, new_cleanup, 1)
+          changes.append('terminate pty child process group before runner cleanup')
+
+          old_launch = '''  dotnet run --no-build --launch-profile https </dev/null > "$log" 2>&1 &
+            local apphost_pid=$!
+            ACTIVE_APPHOST_PID="$apphost_pid"
+          '''
+          new_launch = r'''  local pty_runner="$out/pty-runner.py"
+            local child_pid_file="$out/apphost-child.pid"
+            cat > "$pty_runner" <<'PY_PTY_RUNNER'
+          #!/usr/bin/env python3
+          import errno
+          import os
+          import pathlib
+          import pty
+          import select
+          import signal
+          import sys
+
+          log_path, pid_path, *command = sys.argv[1:]
+          if not command:
+              raise SystemExit('missing command')
+
+          child_pid, master_fd = pty.fork()
+          if child_pid == 0:
+              os.environ.setdefault('TERM', 'xterm-256color')
+              os.execvp(command[0], command)
+
+          pathlib.Path(pid_path).write_text(f'{child_pid}\n', encoding='ascii')
+
+          def forward(sig, _frame):
+              forwarded = signal.SIGINT if sig in (signal.SIGTERM, signal.SIGHUP) else sig
+              try:
+                  os.killpg(child_pid, forwarded)
+              except ProcessLookupError:
+                  pass
+
+          for watched in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+              signal.signal(watched, forward)
+
+          status = None
+          with open(log_path, 'ab', buffering=0) as log:
+              while status is None:
+                  try:
+                      ready, _, _ = select.select([master_fd], [], [], 0.25)
+                  except InterruptedError:
+                      ready = []
+                  if ready:
+                      try:
+                          data = os.read(master_fd, 65536)
+                      except OSError as exc:
+                          if exc.errno != errno.EIO:
+                              raise
+                          data = b''
+                      if data:
+                          log.write(data)
+                  done, observed = os.waitpid(child_pid, os.WNOHANG)
+                  if done == child_pid:
+                      status = observed
+
+          try:
+              os.close(master_fd)
+          except OSError:
+              pass
+          try:
+              pathlib.Path(pid_path).unlink()
+          except FileNotFoundError:
+              pass
+          raise SystemExit(os.waitstatus_to_exitcode(status))
+          PY_PTY_RUNNER
+            chmod 700 "$pty_runner"
+            rm -f "$child_pid_file"
+            python3 "$pty_runner" "$log" "$child_pid_file" dotnet run --no-build --launch-profile https &
+            local apphost_pid=$!
+            ACTIVE_APPHOST_PID="$apphost_pid"
+            ACTIVE_APPHOST_CHILD_PID_FILE="$child_pid_file"
+          '''
+          if source.count(old_launch) != 1:
+              raise SystemExit(f'launch marker count={source.count(old_launch)}')
+          source = source.replace(old_launch, new_launch, 1)
+          changes.append('launch Aspire through a persistent pseudo-terminal')
+
+          run_path.write_text(source)
+          after = hashlib.sha256(source.encode()).hexdigest()
+          json.dump({
+              'schema': 1,
+              'scope': 'execution harness only',
+              'beforeSha256': before,
+              'afterSha256': after,
+              'changes': changes,
+          }, receipt_path.open('w'), indent=2, sort_keys=True)
+          PY_APPLY_PTY
+          python3 - scripts/aspire-v13-bootstrap.sh <<'PY_PATCH_BOOTSTRAP'
+          from pathlib import Path
+          import sys
+          path=Path(sys.argv[1])
+          source=path.read_text()
+          anchor='''bash -n "$PATCHED_RUN"\nnode --check "$PATCHED_BROWSER"\n'''
+          insertion='''bash -n "$PATCHED_RUN"\nnode --check "$PATCHED_BROWSER"\nORIGINAL_PATCHED_RUN_SHA="$PATCHED_RUN_SHA"\npython3 /tmp/apply-aspire-pty-harness.py "$PATCHED_RUN" "$EVIDENCE_DIR/HARNESS_PTY_PATCH.json"\nPATCHED_RUN_SHA="$(shasum -a 256 "$PATCHED_RUN" | awk '{print $1}')"\nbash -n "$PATCHED_RUN"\nprintf '%s  product-patched-run.sh\\n%s  pty-executed-run.sh\\n' "$ORIGINAL_PATCHED_RUN_SHA" "$PATCHED_RUN_SHA" > "$EVIDENCE_DIR/executed-run-hashes.txt"\n'''
+          if source.count(anchor) != 1:
+              raise SystemExit(f'bootstrap anchor count={source.count(anchor)}')
+          path.write_text(source.replace(anchor,insertion,1))
+          PY_PATCH_BOOTSTRAP
           chmod 700 scripts/aspire-v13-bootstrap.sh
           scripts/aspire-v13-bootstrap.sh
 
@@ -88,7 +234,7 @@ jobs:
           shasum -a 256 sealed-evidence/evidence.enc | awk '{print $1}' > sealed-evidence/evidence.cipher.sha256
           {
             echo 'FORMAT=ZDB-AES-256-CBC-PKCS7-V1'
-            echo 'TARGET=Aspire CVE-2026-120006 first-patched/current macOS residual matrix v13b UI lifecycle'
+            echo 'TARGET=Aspire CVE-2026-120006 first-patched/current macOS residual matrix v14 PTY lifecycle'
             echo "RUNNER=${{ runner.os }}-${{ runner.arch }}"
             echo "RUN_ID=${{ github.run_id }}"
             echo "SOURCE_SHA=${{ github.sha }}"
@@ -111,7 +257,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: aspire-cve120006-macos-matrix-v13b-${{ github.sha }}
+          name: aspire-cve120006-macos-matrix-v14-pty-${{ github.sha }}
           path: sealed-evidence
           if-no-files-found: error
           retention-days: 3
