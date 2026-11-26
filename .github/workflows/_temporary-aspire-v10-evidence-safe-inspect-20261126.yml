@@ -1,4 +1,4 @@
-name: Inspect sealed Aspire v10 evidence safely
+name: Inspect latest sealed Aspire lifecycle evidence safely
 
 on:
   push:
@@ -28,8 +28,8 @@ jobs:
           set -euo pipefail
           test -n "$WRAPPING_KEY_B64"
           curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'X-GitHub-Api-Version: 2022-11-28' \
-            https://api.github.com/repos/zerodaybugs/runner-cleanroom-20261114-7f3c9a/actions/artifacts/15074031521/zip -o artifact.zip
-          test "$(sha256sum artifact.zip | awk '{print $1}')" = "c4cc569684c869196e6a0edab6b361165263f73676ec3a2eaeaa8179f8f134aa"
+            https://api.github.com/repos/zerodaybugs/runner-cleanroom-20261114-7f3c9a/actions/artifacts/15130728985/zip -o artifact.zip
+          test "$(sha256sum artifact.zip | awk '{print $1}')" = "54decf88e7e0f7972591bbf6b46b4fbaeda1a7ee633d2d01c9ae5b4cd02fd897"
           mkdir artifact evidence
           unzip -q artifact.zip -d artifact
 
@@ -55,50 +55,39 @@ jobs:
           echo '=== WORKFLOW STATUS ==='
           cat "$ROOT/workflow-status.txt" 2>/dev/null || true
           cat "$ROOT/bootstrap-status.txt" 2>/dev/null || true
-          echo '=== MATRIX SUMMARY SANITIZED ==='
+
+          echo '=== LANE ASSERTIONS ==='
+          find "$ROOT" -mindepth 2 -maxdepth 2 -type f \( -name status.txt -o -name assertion.txt -o -name readiness.txt \) -print0 | sort -z | while IFS= read -r -d '' f; do
+            echo "--- ${f#$ROOT/}"
+            sed -n '1,120p' "$f"
+          done
+
+          echo '=== SANITIZED MATRIX SUMMARY ==='
           python3 - "$ROOT/matrix-summary.json" <<'PY'
           import json,sys
-          try: rows=json.load(open(sys.argv[1]))
-          except Exception as e: print(type(e).__name__,e); raise SystemExit(0)
+          try:
+              rows=json.load(open(sys.argv[1]))
+          except Exception as e:
+              print(type(e).__name__,str(e)); raise SystemExit(0)
+          keep=['lane','aspireVersion','mode','dashboardConnected','linkedServiceOpened','cookieLeak','replayAuthenticated','stockLifecycleExecuted','stopExecuted','startExecuted','errorStage','errorClass']
           for row in rows:
               b=row.get('browser-result.json') or {}
               d=row.get('dcp-scope-assertion.json') or {}
-              keep=['lane','aspireVersion','mode','dashboardConnected','linkedServiceOpened','cookieLeak','replayAuthenticated','commandExecuted','errorStage','errorClass','errorMessage','replayError','replayTitle','cookieHeaderBytes','captureMeta']
-              print(json.dumps({'lane':row.get('lane'),'status':row.get('status'),'assertion':row.get('assertion'),'browser':{k:b.get(k) for k in keep if k in b},'dcpExpected':d.get('expected'),'dcpPass':d.get('pass'),'dashboardServices':d.get('dashboardServices')},sort_keys=True))
+              print(json.dumps({
+                  'lane':row.get('lane'),
+                  'status':row.get('status'),
+                  'assertion':row.get('assertion'),
+                  'browser':{k:b.get(k) for k in keep if k in b},
+                  'dcpExpected':d.get('expected'),
+                  'dcpPass':d.get('pass'),
+                  'dashboardServices':d.get('dashboardServices')
+              },sort_keys=True))
           PY
-          echo '=== LANE ASSERTIONS ==='
-          find "$ROOT" -mindepth 2 -maxdepth 2 -type f \( -name status.txt -o -name assertion.txt -o -name readiness.txt -o -name dcp-scope-assertion.json \) -print0 | sort -z | while IFS= read -r -d '' f; do
+
+          echo '=== SANITIZED ERROR TAILS ==='
+          find "$ROOT" -mindepth 2 -maxdepth 2 -type f \( -name 'apphost-tail.txt' -o -name 'browser.stderr' -o -name 'build.log' \) -print0 | sort -z | while IFS= read -r -d '' f; do
             echo "--- ${f#$ROOT/}"
-            sed -n '1,220p' "$f"
+            tail -100 "$f" | python3 -c 'import re,sys; s=sys.stdin.read(); s=re.sub(r"https?://\\S+","<URL>",s); s=re.sub(r"(?i)(cookie|authorization|token)[=: ]+\\S+",r"\\1=<REDACTED>",s); print(s[-12000:])'
           done
-          echo '=== BROWSER RESULTS ==='
-          find "$ROOT" -mindepth 2 -maxdepth 2 -type f -name browser-result.json -print0 | sort -z | while IFS= read -r -d '' f; do
-            echo "--- ${f#$ROOT/}"
-            python3 - "$f" <<'PY'
-          import json,sys
-          j=json.load(open(sys.argv[1]))
-          keep=['lane','aspireVersion','mode','dashboardConnected','linkedServiceOpened','cookieLeak','replayAuthenticated','commandExecuted','errorStage','errorClass','errorMessage','replayError','replayTitle','cookieHeaderBytes','dashboardLinks','captureMeta']
-          print(json.dumps({k:j.get(k) for k in keep if k in j},indent=2,sort_keys=True))
-          PY
-          done
-          echo '=== ATTACKER/CAPTURE DIAGNOSTICS ==='
-          find "$ROOT" -mindepth 2 -maxdepth 2 -type f \( -name 'capture-meta.json' -o -name 'attacker-container-inspect.json' -o -name 'docker-ps-a.txt' -o -name 'browser.stderr' -o -name 'apphost-tail.txt' \) -print0 | sort -z | while IFS= read -r -d '' f; do
-            echo "--- ${f#$ROOT/}"
-            if [[ "$f" == *attacker-container-inspect.json ]]; then
-              python3 - "$f" <<'PY'
-          import json,sys
-          j=json.load(open(sys.argv[1])); x=j[0] if isinstance(j,list) else j
-          print(json.dumps({'Config':{k:(x.get('Config') or {}).get(k) for k in ['Image','Cmd','Entrypoint','Env']},'State':x.get('State'),'NetworkSettings':x.get('NetworkSettings')},indent=2,sort_keys=True)[:24000])
-          PY
-            else
-              tail -220 "$f"
-            fi
-          done
-          echo '=== FIX CONTROL ==='
-          for f in "$ROOT/natural_fix_control/status.txt" "$ROOT/natural_fix_control/fix-dll.sha256" "$ROOT/natural_fix_control/natural-fix.patch" "$ROOT/natural_fix_control/revert-status.txt"; do
-            [[ -f "$f" ]] && { echo "--- ${f#$ROOT/}"; sed -n '1,260p' "$f"; }
-          done
-          echo '=== BOOTSTRAP TRACE TAIL ==='
-          tail -320 "$ROOT/bootstrap-trace.log" 2>/dev/null || true
 
           rm -rf artifact evidence artifact.zip evidence.zip wrapping.key private.pem payload.key.enc runtime.key
