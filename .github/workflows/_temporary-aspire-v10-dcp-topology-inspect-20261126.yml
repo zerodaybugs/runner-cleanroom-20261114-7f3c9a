@@ -1,0 +1,61 @@
+name: Inspect Aspire v10 DCP topology safely
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v10-dcp-topology-inspect-20261126.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Decrypt and print sanitized DCP topology
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'X-GitHub-Api-Version: 2022-11-28' \
+            https://api.github.com/repos/zerodaybugs/runner-cleanroom-20261114-7f3c9a/actions/artifacts/15074031521/zip -o artifact.zip
+          test "$(sha256sum artifact.zip | awk '{print $1}')" = "c4cc569684c869196e6a0edab6b361165263f73676ec3a2eaeaa8179f8f134aa"
+          mkdir artifact evidence
+          unzip -q artifact.zip -d artifact
+          printf '%s' "$WRAPPING_KEY_B64" | openssl base64 -d -A > wrapping.key
+          WRAP_KEY_HEX="$(od -An -tx1 -v wrapping.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$WRAP_KEY_HEX" -iv "$(tr -d '\r\n ' < bootstrap/private.iv.hex)" \
+            -in bootstrap/private.pem.enc -out private.pem
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v2.key.enc.b64 | openssl base64 -d -A > payload.key.enc
+          openssl pkeyutl -decrypt -inkey private.pem -in payload.key.enc -out runtime.key \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          KEY_HEX="$(od -An -tx1 -v runtime.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$KEY_HEX" -iv "$(tr -d '\r\n ' < artifact/evidence.iv.hex)" \
+            -in artifact/evidence.enc -out evidence.zip
+          test "$(sha256sum evidence.zip | awk '{print $1}')" = "$(tr -d '\r\n ' < artifact/evidence.plain.sha256)"
+          unzip -q evidence.zip -d evidence
+          ROOT="$(find evidence -mindepth 1 -maxdepth 1 -type d | head -1)"
+          for lane in first_patched_13_6_5_legacy current_17_0_0_legacy current_17_0_0_legacy_natural_fix current_17_0_0_legacy_revert_stock; do
+            echo "=== $lane ==="
+            python3 - "$ROOT/$lane/dcp-services.json" <<'PY'
+          import json,sys
+          j=json.load(open(sys.argv[1]))
+          for x in j.get('items',[]):
+              m=x.get('metadata') or {}; a=m.get('annotations') or {}
+              if a.get('resource-name')=='aspire-dashboard' or str(a.get('primary-service-name') or '').startswith('aspire-dashboard'):
+                  out={
+                      'metadata': {'name':m.get('name'),'annotations':a,'labels':m.get('labels')},
+                      'spec':x.get('spec'),
+                      'status':x.get('status'),
+                  }
+                  print(json.dumps(out,sort_keys=True))
+          PY
+          done
+          rm -rf artifact evidence artifact.zip evidence.zip wrapping.key private.pem payload.key.enc runtime.key
