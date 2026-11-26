@@ -1,0 +1,185 @@
+name: Sealed Kestrel Named Pipe 114157 Differential
+
+on:
+  push:
+    branches:
+      - research/kestrel-np-114157-sealed-20261126
+    paths:
+      - '.github/workflows/_temporary-kestrel-np-114157-sealed-20261126.yml'
+      - 'np114157-v2.bundle.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: ${{ matrix.label }}-r${{ matrix.repeat }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: vulnerable-10.0.14
+            sdk: '10.0.401'
+            tfm: 'net10.0'
+            repeat: 1
+          - label: first-patched-10.0.15
+            sdk: '10.0.404'
+            tfm: 'net10.0'
+            repeat: 1
+          - label: first-patched-10.0.15
+            sdk: '10.0.404'
+            tfm: 'net10.0'
+            repeat: 2
+          - label: current-sts-11.0.0
+            sdk: '11.0.100'
+            tfm: 'net11.0'
+            repeat: 1
+          - label: current-sts-11.0.0
+            sdk: '11.0.100'
+            tfm: 'net11.0'
+            repeat: 2
+    runs-on: windows-2025
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+
+      - name: Unseal and execute private validation payload
+        shell: pwsh
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          SDK_VERSION: ${{ matrix.sdk }}
+          TFM: ${{ matrix.tfm }}
+          REPEAT_ID: ${{ matrix.repeat }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WRAPPING_KEY_B64)) { throw 'wrapping key missing' }
+          $wrappingKey = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
+          if ($wrappingKey.Length -ne 32) { throw 'wrapping key length invalid' }
+
+          $wrappedPrivate = [IO.File]::ReadAllBytes((Join-Path $PWD 'bootstrap/private.pem.enc'))
+          $wrapIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'bootstrap/private.iv.hex') -Raw).Trim())
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $wrappingKey
+            $aes.IV = $wrapIv
+            $decryptor = $aes.CreateDecryptor()
+            try { $privatePemBytes = $decryptor.TransformFinalBlock($wrappedPrivate, 0, $wrappedPrivate.Length) }
+            finally { $decryptor.Dispose() }
+          } finally { $aes.Dispose() }
+
+          $bundle = Get-Content -LiteralPath (Join-Path $PWD 'np114157-v2.bundle.json') -Raw | ConvertFrom-Json
+          $rsa = [Security.Cryptography.RSA]::Create()
+          try {
+            $rsa.ImportFromPem([Text.Encoding]::ASCII.GetString($privatePemBytes))
+            $wrappedPayloadKey = [Convert]::FromBase64String($bundle.payloadKeyEncB64)
+            $payloadKey = $rsa.Decrypt($wrappedPayloadKey, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          } finally { $rsa.Dispose() }
+          if ($payloadKey.Length -ne 32) { throw 'payload key length invalid' }
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'np114157-v2.runtime.key'), $payloadKey)
+
+          $payloadIv = [Convert]::FromHexString($bundle.payloadIvHex)
+          $payloadCipher = [Convert]::FromBase64String($bundle.payloadCipherB64)
+          $cipherHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($payloadCipher)).ToLowerInvariant()
+          if ($cipherHash -ne ([string]$bundle.payloadCipherSha256).ToLowerInvariant()) { throw 'ciphertext hash mismatch' }
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $payloadIv
+            $decryptor = $aes.CreateDecryptor()
+            try { $payloadCompressed = $decryptor.TransformFinalBlock($payloadCipher, 0, $payloadCipher.Length) }
+            finally { $decryptor.Dispose() }
+          } finally { $aes.Dispose() }
+
+          $compressedHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($payloadCompressed)).ToLowerInvariant()
+          if ($compressedHash -ne ([string]$bundle.payloadCompressedSha256).ToLowerInvariant()) { throw 'compressed payload hash mismatch' }
+          $inputStream = [IO.MemoryStream]::new($payloadCompressed, $false)
+          $outputStream = [IO.MemoryStream]::new()
+          try {
+            $gzip = [IO.Compression.GZipStream]::new($inputStream, [IO.Compression.CompressionMode]::Decompress)
+            try { $gzip.CopyTo($outputStream) } finally { $gzip.Dispose() }
+            $payloadScript = $outputStream.ToArray()
+          } finally { $inputStream.Dispose(); $outputStream.Dispose() }
+
+          $payloadPath = Join-Path $PWD 'np114157-v2.payload.runtime.ps1'
+          [IO.File]::WriteAllBytes($payloadPath, $payloadScript)
+          $expectedHash = ([string]$bundle.payloadScriptSha256).ToLowerInvariant()
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadPath).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) { throw 'payload script hash mismatch' }
+
+          & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $payloadPath
+          if ($LASTEXITCODE -ne 0) { throw "private validation failed: $LASTEXITCODE" }
+          Write-Host 'SEALED_PRIVATE_VALIDATION_COMPLETE=1'
+
+      - name: Seal private evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $keyPath = Join-Path $PWD 'np114157-v2.runtime.key'
+          $dirs = @(Get-ChildItem -LiteralPath $PWD -Directory -Filter 'evidence-*')
+          if ($dirs.Count -eq 0) {
+            $fallback = Join-Path $PWD 'evidence-fallback'
+            New-Item -ItemType Directory -Force -Path $fallback | Out-Null
+            'NO_EVIDENCE_DIRECTORY' | Set-Content (Join-Path $fallback 'status.txt')
+            $dirs = @((Get-Item -LiteralPath $fallback))
+          }
+          if (-not (Test-Path -LiteralPath $keyPath)) { throw 'payload evidence key unavailable' }
+
+          $zipPath = Join-Path $PWD 'np114157-evidence.plain.zip'
+          Compress-Archive -Path $dirs.FullName -DestinationPath $zipPath -Force
+          $plainHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
+          $payloadKey = [IO.File]::ReadAllBytes($keyPath)
+          $evidenceIv = [Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
+          $plain = [IO.File]::ReadAllBytes($zipPath)
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $payloadKey
+            $aes.IV = $evidenceIv
+            $encryptor = $aes.CreateEncryptor()
+            try { $cipher = $encryptor.TransformFinalBlock($plain, 0, $plain.Length) }
+            finally { $encryptor.Dispose() }
+          } finally { $aes.Dispose() }
+
+          $sealed = Join-Path $PWD 'sealed-evidence'
+          New-Item -ItemType Directory -Force -Path $sealed | Out-Null
+          $cipherPath = Join-Path $sealed 'evidence.enc'
+          [IO.File]::WriteAllBytes($cipherPath, $cipher)
+          [Convert]::ToHexString($evidenceIv).ToLowerInvariant() | Set-Content (Join-Path $sealed 'evidence.iv.hex') -Encoding ascii
+          $plainHash | Set-Content (Join-Path $sealed 'evidence.plain.sha256') -Encoding ascii
+          (Get-FileHash -Algorithm SHA256 -LiteralPath $cipherPath).Hash.ToLowerInvariant() | Set-Content (Join-Path $sealed 'evidence.cipher.sha256') -Encoding ascii
+          @(
+            'FORMAT=ZDB-AES-256-CBC-PKCS7-V1',
+            'SDK=${{ matrix.sdk }}',
+            'TFM=${{ matrix.tfm }}',
+            'LABEL=${{ matrix.label }}',
+            'REPEAT=${{ matrix.repeat }}',
+            'RUN_ID=${{ github.run_id }}',
+            'SOURCE_SHA=${{ github.sha }}'
+          ) | Set-Content (Join-Path $sealed 'metadata.txt') -Encoding ascii
+
+          Write-Host 'SEALED_EVIDENCE=PASS'
+          Remove-Item -LiteralPath $zipPath,$keyPath,(Join-Path $PWD 'np114157-v2.payload.runtime.ps1') -Force -ErrorAction SilentlyContinue
+          Get-ChildItem -LiteralPath $PWD -Directory -Filter 'np-work-*' | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          foreach ($dir in $dirs) { Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+
+      - name: Upload sealed evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: np114157-${{ matrix.label }}-r${{ matrix.repeat }}
+          path: sealed-evidence
+          if-no-files-found: error
+          retention-days: 3
