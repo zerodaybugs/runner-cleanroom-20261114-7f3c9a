@@ -1,0 +1,61 @@
+name: Extract audited Aspire v13 bootstrap script
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-extract-aspire-v13-bootstrap-20261126.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Extract exact corrected run block
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=.github/workflows/_temporary-aspire-cve120006-macos-matrix-v13-ui-lifecycle-20261126.yml
+          mkdir -p scripts
+          python3 - "$target" scripts/aspire-v13-bootstrap.sh <<'PY'
+          from pathlib import Path
+          import sys
+          src=Path(sys.argv[1]).read_text()
+          start=src.index("          python3 - \"$PATCH_CHAIN\" \"$PATCH_MANIFEST\" \"$PATCHED_RUN_SHA\" \"$PATCHED_BROWSER_SHA\" <<'PY_MANIFEST'\n")
+          body_start=start+src[start:].index('\n')+1
+          end=src.index('\nPY_MANIFEST\n',body_start)
+          body=src[body_start:end]
+          lines=body.splitlines()
+          assert lines[0]=='import json,sys'
+          assert lines[-1].startswith("assert manifest['navigation']")
+          fixed=src[:body_start]+'\n'.join('          '+line for line in lines)+'\n          PY_MANIFEST'+src[end+len('\nPY_MANIFEST'):]
+          marker='      - name: Unwrap and execute private first-patched/current matrix\n'
+          pos=fixed.index(marker)
+          run=fixed.index('        run: |\n',pos)+len('        run: |\n')
+          next_step=fixed.index('\n      - name: Emit metadata-only diagnostics\n',run)
+          block=fixed[run:next_step]
+          out=[]
+          for line in block.splitlines():
+              if line:
+                  assert line.startswith('          '), repr(line)
+                  out.append(line[10:])
+              else:
+                  out.append('')
+          text='#!/usr/bin/env bash\n'+'\n'.join(out)+'\n'
+          Path(sys.argv[2]).write_text(text)
+          PY
+          chmod 700 scripts/aspire-v13-bootstrap.sh
+          bash -n scripts/aspire-v13-bootstrap.sh
+          test "$(sha256sum scripts/aspire-v13-bootstrap.sh | awk '{print $1}')" = "ca01cec66af83f0cfb62210a35080aca16b1d5087c99d9febdba10b1f3e07077"
+          git config user.name zerodaybugs
+          git config user.email 80965714+zerodaybugs@users.noreply.github.com
+          git add scripts/aspire-v13-bootstrap.sh
+          git diff --cached --check
+          git commit -m 'add audited Aspire v13 bootstrap script'
+          git push origin HEAD:main
