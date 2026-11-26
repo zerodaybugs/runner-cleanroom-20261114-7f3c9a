@@ -1,0 +1,144 @@
+name: Sealed Aspire CVE-2026-120006 macOS final matrix v16
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v16-final-20261126.yml'
+      - 'scripts/aspire-v16-final-harness.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-macos-final-matrix:
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - name: Checkout sealed clean-room inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install exact .NET SDK lanes
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: |
+            10.0.404
+            11.0.100
+          cache: false
+
+      - name: Install software-virtualized container runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install docker qemu colima
+          colima start --vm-type qemu --arch aarch64 --cpu 3 --memory 6 --disk 30 --runtime docker
+          colima status
+          docker version
+
+      - name: Execute audited private final matrix
+        id: execute
+        continue-on-error: true
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test "$(shasum -a 256 scripts/aspire-v13-bootstrap.sh | awk '{print $1}')" = "61573c91e0efcf1171ed45481c829c7f2e736b5e789bcb6f6a2335966ac8a99c"
+          test "$(shasum -a 256 scripts/aspire-v16-final-harness.py | awk '{print $1}')" = "02142f2ef0706b36be7d024b09ba84857bb7580da919a5c49cc19f2b174973e6"
+          python3 -m py_compile scripts/aspire-v16-final-harness.py
+
+          python3 - scripts/aspire-v13-bootstrap.sh <<'PY_PATCH_BOOTSTRAP'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          source = path.read_text()
+          anchor = '''bash -n "$PATCHED_RUN"\nnode --check "$PATCHED_BROWSER"\n'''
+          insertion = '''bash -n "$PATCHED_RUN"\nnode --check "$PATCHED_BROWSER"\nORIGINAL_PATCHED_RUN_SHA="$PATCHED_RUN_SHA"\npython3 scripts/aspire-v16-final-harness.py "$PATCHED_RUN" "$EVIDENCE_DIR/HARNESS_FINAL_PATCH.json"\nPATCHED_RUN_SHA="$(shasum -a 256 "$PATCHED_RUN" | awk '{print $1}')"\nbash -n "$PATCHED_RUN"\nprintf '%s  product-patched-run.sh\\n%s  final-executed-run.sh\\n' "$ORIGINAL_PATCHED_RUN_SHA" "$PATCHED_RUN_SHA" > "$EVIDENCE_DIR/executed-run-hashes.txt"\n'''
+          if source.count(anchor) != 1:
+              raise SystemExit(f'bootstrap anchor count={source.count(anchor)}')
+          path.write_text(source.replace(anchor, insertion, 1))
+          PY_PATCH_BOOTSTRAP
+
+          chmod 700 scripts/aspire-v13-bootstrap.sh scripts/aspire-v16-final-harness.py
+          scripts/aspire-v13-bootstrap.sh
+
+      - name: Emit metadata-only diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          echo '=== EXACT SDK/RUNTIME ==='
+          dotnet --info | sed -n '1,110p' || true
+          echo '=== ASPIRE.HOSTING OUTPUTS ==='
+          find zdb-matrix-work -type f -name 'Aspire.Hosting.dll' -print 2>/dev/null | sort || true
+          echo '=== LANE STATUS FILES ==='
+          find evidence-aspire120006-macos-v13-ui-lifecycle -maxdepth 2 -type f \( -name status.txt -o -name assertion.txt -o -name readiness.txt -o -name post-browser-health.json -o -name framework-lane.txt -o -name fix-dll.sha256 -o -name bootstrap-status.txt \) -print 2>/dev/null | sort || true
+
+      - name: Seal final matrix evidence
+        if: always()
+        shell: bash
+        env:
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+          MATRIX_RC: ${{ steps.execute.outputs.matrix_rc }}
+          PATCHED_RUN_SHA: ${{ steps.execute.outputs.patched_run_sha }}
+          PATCHED_BROWSER_SHA: ${{ steps.execute.outputs.patched_browser_sha }}
+        run: |
+          set -euo pipefail
+          test -f matrix.runtime.key
+          EVIDENCE_DIR=evidence-aspire120006-macos-v13-ui-lifecycle
+          if [[ ! -d "$EVIDENCE_DIR" ]]; then
+            mkdir -p "$EVIDENCE_DIR"
+            printf 'NO_EVIDENCE_DIRECTORY\n' > "$EVIDENCE_DIR/status.txt"
+          fi
+          printf 'EXECUTE_OUTCOME=%s\nMATRIX_RC=%s\n' "$EXECUTE_OUTCOME" "$MATRIX_RC" > "$EVIDENCE_DIR/workflow-status.txt"
+          ditto -c -k --sequesterRsrc --keepParent "$EVIDENCE_DIR" evidence.plain.zip
+          PLAIN_SHA="$(shasum -a 256 evidence.plain.zip | awk '{print $1}')"
+          EVIDENCE_IV="$(openssl rand -hex 16)"
+          KEY_HEX="$(od -An -tx1 -v matrix.runtime.key | tr -d ' \n')"
+          openssl enc -aes-256-cbc -K "$KEY_HEX" -iv "$EVIDENCE_IV" -in evidence.plain.zip -out evidence.enc
+          mkdir -p sealed-evidence
+          mv evidence.enc sealed-evidence/evidence.enc
+          printf '%s\n' "$EVIDENCE_IV" > sealed-evidence/evidence.iv.hex
+          printf '%s\n' "$PLAIN_SHA" > sealed-evidence/evidence.plain.sha256
+          shasum -a 256 sealed-evidence/evidence.enc | awk '{print $1}' > sealed-evidence/evidence.cipher.sha256
+          {
+            echo 'FORMAT=ZDB-AES-256-CBC-PKCS7-V1'
+            echo 'TARGET=Aspire CVE-2026-120006 final first-patched/current net10/net11 missed-fix matrix v16'
+            echo "RUNNER=${{ runner.os }}-${{ runner.arch }}"
+            echo "RUN_ID=${{ github.run_id }}"
+            echo "SOURCE_SHA=${{ github.sha }}"
+            echo "EXECUTE_OUTCOME=$EXECUTE_OUTCOME"
+            echo "MATRIX_RC=$MATRIX_RC"
+            echo 'BOOTSTRAP_SHA256=61573c91e0efcf1171ed45481c829c7f2e736b5e789bcb6f6a2335966ac8a99c'
+            echo 'HARNESS_PATCHER_SHA256=02142f2ef0706b36be7d024b09ba84857bb7580da919a5c49cc19f2b174973e6'
+            echo 'PAYLOAD_PLAIN_SHA256=ba640f7ae180b198351ff27f579158fabad7a7057261133bc5888dfe2e50a9f9'
+            echo 'OVERLAY_PLAIN_SHA256=2e243347869e6d1db49b093e37aa66225b59ad44522da837f792064b92b34079'
+            echo 'PATCH_PLAIN_SHA256=f13f6a8545b3a7edcfcc68e6af78cfc08a04f4ad2b9718dd5b74c2c60e786fd8'
+            echo 'PYTHON_IMAGE_INDEX_SHA256=22eafb370920ad8b429e0aec3fff433e0669968519f5d60469d83729c138b28b'
+            echo "PATCHED_RUN_SHA256=$PATCHED_RUN_SHA"
+            echo "PATCHED_BROWSER_SHA256=$PATCHED_BROWSER_SHA"
+            echo 'SINK=stock Aspire Dashboard Stop/Start lifecycle commands'
+            echo 'NAVIGATION=stock Dashboard resource row to explicit HTTPS endpoint link'
+          } > sealed-evidence/metadata.txt
+          rm -rf evidence.plain.zip "$EVIDENCE_DIR" private-payload overlay payload.zip payload.enc payload.key.enc overlay.enc.b64.norm overlay.enc overlay.key.enc overlay.runtime.key overlay.zip patch.enc.b64.norm patch.enc patch.key.enc patch.runtime.key patch.zip patch patched-v11 patched-v13 private.pem wrapping.key matrix.runtime.key
+
+      - name: Upload sealed final matrix evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aspire-cve120006-macos-final-matrix-v16-${{ github.sha }}
+          path: sealed-evidence
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Enforce final matrix result
+        if: always()
+        shell: bash
+        run: |
+          if [[ '${{ steps.execute.outcome }}' != 'success' ]]; then
+            echo 'Final sealed Aspire matrix did not satisfy every required lane; inspect encrypted evidence.'
+            exit 1
+          fi
