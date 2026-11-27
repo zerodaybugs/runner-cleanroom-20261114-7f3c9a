@@ -1,4 +1,5 @@
 name: Sealed Aspire CVE-2026-120006 macOS final matrix v18 direct AppHost
+# trigger: v18-direct-r1
 
 on:
   push:
