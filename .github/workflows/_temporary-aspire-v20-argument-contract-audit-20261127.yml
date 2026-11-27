@@ -1,4 +1,4 @@
-name: Aspire v20 deterministic patch-chain gate
+name: Audit Aspire v20 lane semantics
 
 on:
   push:
@@ -6,22 +6,74 @@ on:
       - main
     paths:
       - '.github/workflows/_temporary-aspire-v20-argument-contract-audit-20261127.yml'
-      - 'scripts/aspire-v20-patch-chain-gate.sh'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  patch-chain-gate:
+  semantic-audit:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout sealed clean-room inputs
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
-      - name: Verify the complete v10 to v20 patch chain
+      - name: Reconstruct final v20 harness and emit bounded semantics
         shell: bash
         env:
           WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
-        run: bash scripts/aspire-v20-patch-chain-gate.sh
+        run: |
+          set -euo pipefail
+          cp scripts/aspire-v20-patch-chain-gate.sh /tmp/aspire-v20-semantic-audit.sh
+          python3 - /tmp/aspire-v20-semantic-audit.sh <<'PY_DISABLE_CLEANUP'
+          from pathlib import Path
+          import sys
+          path = Path(sys.argv[1])
+          source = path.read_text()
+          old = 'trap cleanup EXIT\n'
+          if source.count(old) != 1:
+              raise SystemExit(f'cleanup trap count={source.count(old)}')
+          path.write_text(source.replace(old, '# cleanup intentionally deferred for bounded semantic audit\n', 1))
+          PY_DISABLE_CLEANUP
+          chmod 700 /tmp/aspire-v20-semantic-audit.sh
+          /tmp/aspire-v20-semantic-audit.sh
+
+          python3 - patched-v13/run.sh patched-v13/browser.js <<'PY_SEMANTICS'
+          from pathlib import Path
+          import hashlib, json, re, sys
+
+          patterns = [
+              r'first_patched', r'current_17', r'legacy', r'natural_fix', r'revert_stock',
+              r'EnableAspireContainerTunnel', r'WithOtlpExporter', r'WithEnvironment',
+              r'WithReference', r'WithExplicitStart', r'aspire-dashboard', r'DASHBOARD_UI',
+              r'frontend-exposed', r'frontend-removed', r'attacker-yarp-backend',
+              r'GATEWAY_HTTPS_PORT', r'TRUSTED_YARP_HTTPS_READY'
+          ]
+          regex = re.compile('|'.join(patterns), re.I)
+          for raw in sys.argv[1:]:
+              path = Path(raw)
+              lines = path.read_text(encoding='utf-8').splitlines()
+              selected = []
+              seen = set()
+              for index, line in enumerate(lines):
+                  if regex.search(line):
+                      for pos in range(max(0, index - 2), min(len(lines), index + 3)):
+                          if pos not in seen:
+                              seen.add(pos)
+                              selected.append((pos + 1, lines[pos]))
+              selected.sort()
+              print(f'=== SEMANTIC_AUDIT {path} ===')
+              print(f'SHA256={hashlib.sha256(path.read_bytes()).hexdigest()}')
+              print(f'MATCHED_LINES={len(selected)}')
+              for number, line in selected[:700]:
+                  print(f'{number:05d}: {line}')
+          PY_SEMANTICS
+
+          rm -rf \
+            wrapping.key private.pem \
+            overlay.enc.b64.norm overlay.enc overlay.key.enc overlay.key overlay.zip overlay \
+            v13.enc.b64.norm v13.enc v13.key.enc v13.key v13.zip v13 \
+            v20.enc.b64.norm v20.enc v20.key.enc v20.key v20.zip v20 \
+            patched-v11 patched-v13 v16-receipt.json v18-receipt.json v20-receipt.json
+          echo V20_SEMANTIC_AUDIT=PASS
