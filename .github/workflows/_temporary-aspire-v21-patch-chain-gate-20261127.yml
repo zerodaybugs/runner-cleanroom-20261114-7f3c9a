@@ -1,0 +1,90 @@
+name: Gate sealed Aspire v21 patch chain
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v21-patch-chain-gate-20261127.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  patch-chain-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sealed clean-room inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Reconstruct v20 chain and apply sealed v21 overlay
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$WRAPPING_KEY_B64"
+          test -f scripts/aspire-v20-patch-chain-gate.sh
+          test "$(sha256sum scripts/aspire-v21-apply.sh | awk '{print $1}')" = \
+            '22051d15451929bb6f28a2efd491978c3855d24dfcd62881aef023fdf56c0b9b'
+          bash -n scripts/aspire-v20-patch-chain-gate.sh
+          bash -n scripts/aspire-v21-apply.sh
+
+          python3 - scripts/aspire-v20-patch-chain-gate.sh v21-chain-gate.sh <<'PY_GATE'
+          from pathlib import Path
+          import sys
+
+          source_path = Path(sys.argv[1])
+          output_path = Path(sys.argv[2])
+          source = source_path.read_text()
+          anchor = '''python3 "$PATCHER" "$RUN" "$BROWSER" v20-receipt.json
+
+test "$(sha256sum "$RUN" | awk '{print $1}')" = "$(v20_get OUTPUT_RUN_SHA256)"
+test "$(sha256sum "$BROWSER" | awk '{print $1}')" = "$(v20_get OUTPUT_BROWSER_SHA256)"
+bash -n "$RUN"
+node --check "$BROWSER"
+python3 -m json.tool v16-receipt.json >/dev/null
+python3 -m json.tool v18-receipt.json >/dev/null
+python3 -m json.tool v20-receipt.json >/dev/null
+'''
+          replacement = '''python3 "$PATCHER" "$RUN" "$BROWSER" v20-receipt.json
+
+test "$(sha256sum "$RUN" | awk '{print $1}')" = "$(v20_get OUTPUT_RUN_SHA256)"
+test "$(sha256sum "$BROWSER" | awk '{print $1}')" = "$(v20_get OUTPUT_BROWSER_SHA256)"
+bash scripts/aspire-v21-apply.sh "$RUN" "$BROWSER" v21-receipt.json
+
+test "$(sha256sum "$RUN" | awk '{print $1}')" = \
+  c8b83bbf3aa91ba91b73771cabea69c521cdbd7fe6f21beed84191bf8635da9a
+test "$(sha256sum "$BROWSER" | awk '{print $1}')" = \
+  a5553a24a95f9bd1b4f340e5acdcd6ee8d63588d875700ce0024ed659005351e
+bash -n "$RUN"
+node --check "$BROWSER"
+python3 -m json.tool v16-receipt.json >/dev/null
+python3 -m json.tool v18-receipt.json >/dev/null
+python3 -m json.tool v20-receipt.json >/dev/null
+python3 -m json.tool v21-receipt.json >/dev/null
+'''
+          if source.count(anchor) != 1:
+              raise SystemExit(f'v20 chain anchor count={source.count(anchor)}')
+          source = source.replace(anchor, replacement, 1)
+          source = source.replace('echo V20_PATCH_CHAIN_GATE=PASS', '''
+if grep -Fq 'env.DASHBOARD_PORT' "$BROWSER"; then
+  echo 'injected Dashboard port remains after v21 chain' >&2
+  exit 41
+fi
+if grep -Eq '(^|[[:space:]])DASHBOARD_PORT=' "$RUN"; then
+  echo 'Dashboard-port environment injection remains after v21 chain' >&2
+  exit 42
+fi
+grep -Fq 'dashboardPortDiscoveredFromReferrer' "$BROWSER"
+grep -Fq 'discoveredDashboardPortMatchesLoginOrigin' "$BROWSER"
+grep -Fq 'captured_dashboard_port' "$RUN"
+grep -Fq 'EXPORTED_PRIVATE_KEY_REMOVED=PASS' "$RUN"
+echo V21_PATCH_CHAIN_GATE=PASS''', 1)
+          output_path.write_text(source)
+          PY_GATE
+
+          bash -n v21-chain-gate.sh
+          chmod 700 v21-chain-gate.sh scripts/aspire-v21-apply.sh
+          WRAPPING_KEY_B64="$WRAPPING_KEY_B64" ./v21-chain-gate.sh
