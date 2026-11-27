@@ -1,4 +1,5 @@
 name: Aspire v21 macOS noninteractive devcert smoke
+# trigger: portable-timeout-r2
 
 on:
   push:
@@ -26,6 +27,24 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+
+          run_timeout() {
+            local seconds="$1"
+            shift
+            python3 - "$seconds" "$@" <<'PY_TIMEOUT'
+          import subprocess
+          import sys
+          seconds = float(sys.argv[1])
+          command = sys.argv[2:]
+          try:
+              completed = subprocess.run(command, timeout=seconds, check=False)
+              raise SystemExit(completed.returncode)
+          except subprocess.TimeoutExpired:
+              print(f'TIMEOUT after {seconds}s: {command}', file=sys.stderr)
+              raise SystemExit(124)
+          PY_TIMEOUT
+          }
+
           work="$RUNNER_TEMP/aspire-v21-devcert-smoke"
           rm -rf "$work"
           mkdir -p "$work"
@@ -33,8 +52,8 @@ jobs:
           key="$work/aspire-devcert.key"
           server_log="$work/openssl-server.log"
 
-          timeout 60 dotnet dev-certs https --clean
-          timeout 60 dotnet dev-certs https \
+          run_timeout 60 dotnet dev-certs https --clean
+          run_timeout 60 dotnet dev-certs https \
             --export-path "$cert" \
             --format PEM \
             --no-password
@@ -42,14 +61,14 @@ jobs:
           test -s "$key"
           openssl x509 -in "$cert" -noout -subject -issuer -serial -dates -fingerprint -sha256
 
-          sudo security add-trusted-cert \
+          run_timeout 60 sudo security add-trusted-cert \
             -d \
             -r trustRoot \
             -k /Library/Keychains/System.keychain \
             "$cert"
 
-          timeout 60 dotnet dev-certs https --check --trust
-          security verify-cert -c "$cert" -p ssl -s localhost
+          run_timeout 60 dotnet dev-certs https --check --trust
+          run_timeout 60 security verify-cert -c "$cert" -p ssl -s localhost
 
           openssl s_server \
             -accept 9443 \
