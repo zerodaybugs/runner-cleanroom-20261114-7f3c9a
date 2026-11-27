@@ -64,7 +64,11 @@ test "$(shasum -a 256 v20-patch.zip | awk '{print $1}')" = \
   "$(v20_get PATCH_PLAIN_SHA256)"
 
 mkdir v20-patch
-ditto -x -k v20-patch.zip v20-patch
+if command -v ditto >/dev/null 2>&1; then
+  ditto -x -k v20-patch.zip v20-patch
+else
+  unzip -q v20-patch.zip -d v20-patch
+fi
 PATCHER=v20-patch/aspire-v20-patcher/patch.py
 test -f "$PATCHER"
 test "$(shasum -a 256 "$PATCHER" | awk '{print $1}')" = \
