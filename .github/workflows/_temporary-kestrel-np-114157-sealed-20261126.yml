@@ -62,6 +62,14 @@ jobs:
           $wrappingKey = [Convert]::FromBase64String($env:WRAPPING_KEY_B64)
           if ($wrappingKey.Length -ne 32) { throw 'wrapping key length invalid' }
 
+          @{
+            sdk = @{
+              version = $env:SDK_VERSION
+              rollForward = 'disable'
+              allowPrerelease = $false
+            }
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $PWD 'global.json') -Encoding utf8
+
           $wrappedPrivate = [IO.File]::ReadAllBytes((Join-Path $PWD 'bootstrap/private.pem.enc'))
           $wrapIv = [Convert]::FromHexString((Get-Content -LiteralPath (Join-Path $PWD 'bootstrap/private.iv.hex') -Raw).Trim())
           $aes = [Security.Cryptography.Aes]::Create()
@@ -117,6 +125,15 @@ jobs:
           $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadPath).Hash.ToLowerInvariant()
           if ($actualHash -ne $expectedHash) { throw 'payload script hash mismatch' }
 
+          $payloadText = [IO.File]::ReadAllText($payloadPath)
+          $payloadText = $payloadText.Replace(
+            'options.RequestHeadersTimeout = TimeSpan.FromMinutes(5);',
+            'options.Limits.RequestHeadersTimeout = TimeSpan.FromMinutes(5);')
+          $payloadText = $payloadText.Replace(
+            'options.KeepAliveTimeout = TimeSpan.FromMinutes(5);',
+            'options.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(5);')
+          [IO.File]::WriteAllText($payloadPath, $payloadText, [Text.UTF8Encoding]::new($false))
+
           & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $payloadPath
           $privateExit = $LASTEXITCODE
           if ($privateExit -ne 0) {
@@ -131,6 +148,11 @@ jobs:
               if (Test-Path -LiteralPath $buildLog) {
                 Write-Host '=== BUILD LOG ==='
                 Get-Content -LiteralPath $buildLog
+              }
+              $runLog = Join-Path $_.FullName 'run.log'
+              if (Test-Path -LiteralPath $runLog) {
+                Write-Host '=== RUN LOG ==='
+                Get-Content -LiteralPath $runLog
               }
             }
             Write-Host 'PRIVATE_VALIDATION_DIAGNOSTICS_END'
@@ -188,7 +210,7 @@ jobs:
           ) | Set-Content (Join-Path $sealed 'metadata.txt') -Encoding ascii
 
           Write-Host 'SEALED_EVIDENCE=PASS'
-          Remove-Item -LiteralPath $zipPath,$keyPath,(Join-Path $PWD 'np114157-v2.payload.runtime.ps1') -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $zipPath,$keyPath,(Join-Path $PWD 'np114157-v2.payload.runtime.ps1'),(Join-Path $PWD 'global.json') -Force -ErrorAction SilentlyContinue
           Get-ChildItem -LiteralPath $PWD -Directory -Filter 'np-work-*' | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
           foreach ($dir in $dirs) { Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 
