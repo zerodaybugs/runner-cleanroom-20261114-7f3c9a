@@ -1,4 +1,5 @@
 name: Aspire v20 deterministic patch-chain gate
+# trigger: patch-chain-r1
 
 on:
   push:
