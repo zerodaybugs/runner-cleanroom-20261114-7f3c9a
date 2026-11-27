@@ -1,5 +1,5 @@
 name: Gate sealed Aspire v21 patch chain
-# trigger: v21-chain-r3-standalone
+# trigger: v21-chain-r4-path
 
 on:
   push:
@@ -38,4 +38,5 @@ jobs:
           bash -n scripts/aspire-v21-patch-chain-gate.sh
           bash -n scripts/aspire-v21-apply.sh
           chmod 700 scripts/aspire-v21-patch-chain-gate.sh scripts/aspire-v21-apply.sh
+          export PATH="$PWD:$PATH"
           scripts/aspire-v21-patch-chain-gate.sh
