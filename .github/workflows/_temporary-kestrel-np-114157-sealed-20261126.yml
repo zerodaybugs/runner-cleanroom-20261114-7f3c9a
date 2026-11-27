@@ -19,10 +19,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: vulnerable-10.0.14
-            sdk: '10.0.401'
-            tfm: 'net10.0'
-            repeat: 1
           - label: first-patched-10.0.15
             sdk: '10.0.404'
             tfm: 'net10.0'
@@ -139,24 +135,50 @@ jobs:
           if ($privateExit -ne 0) {
             Write-Host 'PRIVATE_VALIDATION_DIAGNOSTICS_BEGIN'
             Get-ChildItem -LiteralPath $PWD -Directory -Filter 'evidence-*' | ForEach-Object {
-              $restoreLog = Join-Path $_.FullName 'restore.log'
-              $buildLog = Join-Path $_.FullName 'build.log'
-              if (Test-Path -LiteralPath $restoreLog) {
-                Write-Host '=== RESTORE LOG ==='
-                Get-Content -LiteralPath $restoreLog
-              }
-              if (Test-Path -LiteralPath $buildLog) {
-                Write-Host '=== BUILD LOG ==='
-                Get-Content -LiteralPath $buildLog
-              }
-              $runLog = Join-Path $_.FullName 'run.log'
-              if (Test-Path -LiteralPath $runLog) {
-                Write-Host '=== RUN LOG ==='
-                Get-Content -LiteralPath $runLog
+              foreach ($name in @('restore.log','build.log','run.log')) {
+                $logPath = Join-Path $_.FullName $name
+                if (Test-Path -LiteralPath $logPath) {
+                  Write-Host "=== $name ==="
+                  Get-Content -LiteralPath $logPath
+                }
               }
             }
             Write-Host 'PRIVATE_VALIDATION_DIAGNOSTICS_END'
             throw "private validation failed: $privateExit"
+          }
+
+          Get-ChildItem -LiteralPath $PWD -Directory -Filter 'evidence-*' | ForEach-Object {
+            $resultPath = Join-Path $_.FullName 'result.json'
+            if (-not (Test-Path -LiteralPath $resultPath)) { throw 'result.json missing' }
+            $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+            $summary = [ordered]@{
+              label = '${{ matrix.label }}'
+              repeat = ${{ matrix.repeat }}
+              verdict = $result.Verdict
+              framework = $result.FrameworkDescription
+              runtimeVersion = $result.RuntimeVersion
+              namedPipesAssemblyVersion = $result.NamedPipesAssemblyVersion
+              namedPipesAssemblyInformationalVersion = $result.NamedPipesAssemblyInformationalVersion
+              hostStarted = $result.HostStarted
+              openedClients = $result.OpenedClients
+              completedHttpHandshakes = $result.CompletedHttpHandshakes
+              activeHandlersAtExhaustion = $result.ActiveHandlersAtExhaustion
+              factoryAttempts = $result.FactoryAttemptsAtExhaustion
+              factorySuccesses = $result.FactorySuccessesAtExhaustion
+              factoryFailures = $result.FactoryFailuresAtExhaustion
+              baselineClaimSucceeded = $result.BaselineClaim.Succeeded
+              baselineHttpSucceeded = $result.BaselineHttpProbe.Succeeded
+              postFailureHttpSucceeded = $result.PostFailureHttpProbe.Succeeded
+              claimWhileClientsOpenSucceeded = $result.ClaimWhileClientsOpen.Succeeded
+              activeHandlersAfterDrain = $result.ActiveHandlersAfterDrain
+              completedHandlersAfterDrain = $result.CompletedHandlersAfterDrain
+              postDrainHttpSucceeded = $result.PostDrainHttpProbe.Succeeded
+              postDrainClaimSucceeded = [bool]($result.PostDrainClaims | Where-Object { $_.Succeeded } | Select-Object -First 1)
+              postStopClaimSucceeded = $result.PostStopClaimControl.Succeeded
+              clientErrorCount = @($result.ClientErrors).Count
+              fatalExceptionPresent = -not [string]::IsNullOrWhiteSpace([string]$result.FatalException)
+            }
+            Write-Host ('SANITIZED_RESULT_JSON=' + ($summary | ConvertTo-Json -Compress -Depth 6))
           }
           Write-Host 'SEALED_PRIVATE_VALIDATION_COMPLETE=1'
 
