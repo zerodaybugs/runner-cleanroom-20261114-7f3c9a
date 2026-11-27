@@ -1,0 +1,81 @@
+name: Aspire v21 macOS noninteractive devcert smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v21-macos-devcert-smoke-20261127.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-devcert-smoke:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Install exact .NET SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 10.0.404
+          cache: false
+
+      - name: Validate noninteractive certificate generation and trust
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$RUNNER_TEMP/aspire-v21-devcert-smoke"
+          rm -rf "$work"
+          mkdir -p "$work"
+          cert="$work/aspire-devcert.crt"
+          key="$work/aspire-devcert.key"
+          server_log="$work/openssl-server.log"
+
+          timeout 60 dotnet dev-certs https --clean
+          timeout 60 dotnet dev-certs https \
+            --export-path "$cert" \
+            --format PEM \
+            --no-password
+          test -s "$cert"
+          test -s "$key"
+          openssl x509 -in "$cert" -noout -subject -issuer -serial -dates -fingerprint -sha256
+
+          sudo security add-trusted-cert \
+            -d \
+            -r trustRoot \
+            -k /Library/Keychains/System.keychain \
+            "$cert"
+
+          timeout 60 dotnet dev-certs https --check --trust
+          security verify-cert -c "$cert" -p ssl -s localhost
+
+          openssl s_server \
+            -accept 9443 \
+            -cert "$cert" \
+            -key "$key" \
+            -www > "$server_log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; rm -rf "$work"' EXIT
+
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 3 https://localhost:9443/ >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 0.5
+          done
+          test "$ready" = 1
+          kill "$server_pid" 2>/dev/null || true
+          wait "$server_pid" 2>/dev/null || true
+
+          printf '%s\n' \
+            'DEVCERT_GENERATE=PASS' \
+            'SYSTEM_KEYCHAIN_IMPORT=PASS' \
+            'DOTNET_TRUST_CHECK=PASS' \
+            'SECURITY_VERIFY_CERT=PASS' \
+            'CURL_SYSTEM_TRUST=PASS'
+          rm -rf "$work"
+          trap - EXIT
