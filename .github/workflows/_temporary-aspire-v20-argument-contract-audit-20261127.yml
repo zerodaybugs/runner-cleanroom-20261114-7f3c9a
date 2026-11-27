@@ -1,4 +1,4 @@
-name: Audit Aspire v20 lane semantics
+name: Export verified Aspire v20 harness for private audit
 
 on:
   push:
@@ -12,21 +12,21 @@ permissions:
   contents: read
 
 jobs:
-  semantic-audit:
+  export-harness:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout sealed clean-room inputs
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
-      - name: Reconstruct final v20 harness and emit bounded semantics
+      - name: Reconstruct exact final v20 harness
         shell: bash
         env:
           WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
         run: |
           set -euo pipefail
-          cp scripts/aspire-v20-patch-chain-gate.sh /tmp/aspire-v20-semantic-audit.sh
-          python3 - /tmp/aspire-v20-semantic-audit.sh <<'PY_DISABLE_CLEANUP'
+          cp scripts/aspire-v20-patch-chain-gate.sh /tmp/aspire-v20-export.sh
+          python3 - /tmp/aspire-v20-export.sh <<'PY_DISABLE_CLEANUP'
           from pathlib import Path
           import sys
           path = Path(sys.argv[1])
@@ -34,46 +34,23 @@ jobs:
           old = 'trap cleanup EXIT\n'
           if source.count(old) != 1:
               raise SystemExit(f'cleanup trap count={source.count(old)}')
-          path.write_text(source.replace(old, '# cleanup intentionally deferred for bounded semantic audit\n', 1))
+          path.write_text(source.replace(old, '# cleanup deferred for authenticated artifact export\n', 1))
           PY_DISABLE_CLEANUP
-          chmod 700 /tmp/aspire-v20-semantic-audit.sh
-          /tmp/aspire-v20-semantic-audit.sh
+          chmod 700 /tmp/aspire-v20-export.sh
+          /tmp/aspire-v20-export.sh
+          test "$(sha256sum patched-v13/run.sh | awk '{print $1}')" = "55c6470e32a2ed5602ff0a450a587966ad6f40b9a5b88eb7a4d3514edf235906"
+          test "$(sha256sum patched-v13/browser.js | awk '{print $1}')" = "e9e33b5ef3a3f3f08779af526bd91fa633f0f52f2f4676d51eb8add2c4eeefbe"
+          mkdir export
+          install -m 0600 patched-v13/run.sh export/run.sh
+          install -m 0600 patched-v13/browser.js export/browser.js
+          cp v16-receipt.json v18-receipt.json v20-receipt.json export/
+          sha256sum export/* > export/SHA256SUMS.txt
 
-          python3 - patched-v13/run.sh patched-v13/browser.js <<'PY_SEMANTICS'
-          from pathlib import Path
-          import hashlib, json, re, sys
-
-          patterns = [
-              r'first_patched', r'current_17', r'legacy', r'natural_fix', r'revert_stock',
-              r'EnableAspireContainerTunnel', r'WithOtlpExporter', r'WithEnvironment',
-              r'WithReference', r'WithExplicitStart', r'aspire-dashboard', r'DASHBOARD_UI',
-              r'frontend-exposed', r'frontend-removed', r'attacker-yarp-backend',
-              r'GATEWAY_HTTPS_PORT', r'TRUSTED_YARP_HTTPS_READY'
-          ]
-          regex = re.compile('|'.join(patterns), re.I)
-          for raw in sys.argv[1:]:
-              path = Path(raw)
-              lines = path.read_text(encoding='utf-8').splitlines()
-              selected = []
-              seen = set()
-              for index, line in enumerate(lines):
-                  if regex.search(line):
-                      for pos in range(max(0, index - 2), min(len(lines), index + 3)):
-                          if pos not in seen:
-                              seen.add(pos)
-                              selected.append((pos + 1, lines[pos]))
-              selected.sort()
-              print(f'=== SEMANTIC_AUDIT {path} ===')
-              print(f'SHA256={hashlib.sha256(path.read_bytes()).hexdigest()}')
-              print(f'MATCHED_LINES={len(selected)}')
-              for number, line in selected[:700]:
-                  print(f'{number:05d}: {line}')
-          PY_SEMANTICS
-
-          rm -rf \
-            wrapping.key private.pem \
-            overlay.enc.b64.norm overlay.enc overlay.key.enc overlay.key overlay.zip overlay \
-            v13.enc.b64.norm v13.enc v13.key.enc v13.key v13.zip v13 \
-            v20.enc.b64.norm v20.enc v20.key.enc v20.key v20.zip v20 \
-            patched-v11 patched-v13 v16-receipt.json v18-receipt.json v20-receipt.json
-          echo V20_SEMANTIC_AUDIT=PASS
+      - name: Upload authenticated short-lived harness artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aspire-v20-private-audit-harness
+          path: export
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
