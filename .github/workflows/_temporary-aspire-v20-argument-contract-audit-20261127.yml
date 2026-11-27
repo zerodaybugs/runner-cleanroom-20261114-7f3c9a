@@ -1,4 +1,5 @@
 name: Export verified Aspire v20 harness for private audit
+# trigger: private-export-r1
 
 on:
   push:
