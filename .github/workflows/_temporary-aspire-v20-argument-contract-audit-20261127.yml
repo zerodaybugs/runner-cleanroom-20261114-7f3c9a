@@ -1,0 +1,130 @@
+name: Resolve Aspire v19-v20 patch argument contracts
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v20-argument-contract-audit-20261127.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  argument-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout sealed clean-room inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Decrypt and extract metadata-only argument contracts
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$WRAPPING_KEY_B64"
+
+          meta_get() {
+            local file="$1" key="$2"
+            awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$file"
+          }
+
+          printf '%s' "$WRAPPING_KEY_B64" | openssl base64 -d -A > wrapping.key
+          test "$(wc -c < wrapping.key | tr -d ' ')" = 32
+          WRAP_KEY_HEX="$(od -An -tx1 -v wrapping.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc -K "$WRAP_KEY_HEX" \
+            -iv "$(tr -d '\r\n ' < bootstrap/private.iv.hex)" \
+            -in bootstrap/private.pem.enc -out private.pem
+
+          decrypt_bundle() {
+            local label="$1" meta="$2" b64glob="$3" keyfile="$4" outzip="$5"
+            cat $b64glob | tr -d '\r\n ' > "$label.enc.b64.norm"
+            test "$(sha256sum "$label.enc.b64.norm" | awk '{print $1}')" = "$(meta_get "$meta" PATCH_B64_NORMALIZED_SHA256)"
+            openssl base64 -d -A -in "$label.enc.b64.norm" -out "$label.enc"
+            test "$(sha256sum "$label.enc" | awk '{print $1}')" = "$(meta_get "$meta" PATCH_CIPHER_SHA256)"
+            tr -d '\r\n ' < "$keyfile" | openssl base64 -d -A > "$label.key.enc"
+            test "$(sha256sum "$label.key.enc" | awk '{print $1}')" = "$(meta_get "$meta" PATCH_KEY_CIPHER_SHA256)"
+            openssl pkeyutl -decrypt -inkey private.pem -in "$label.key.enc" -out "$label.key" \
+              -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+            test "$(wc -c < "$label.key" | tr -d ' ')" = 32
+            local key_hex
+            key_hex="$(od -An -tx1 -v "$label.key" | tr -d ' \n')"
+            openssl enc -d -aes-256-cbc -K "$key_hex" -iv "$(meta_get "$meta" PATCH_IV_HEX)" \
+              -in "$label.enc" -out "$outzip"
+            test "$(sha256sum "$outzip" | awk '{print $1}')" = "$(meta_get "$meta" PATCH_PLAIN_SHA256)"
+          }
+
+          decrypt_bundle v19 sealed/aspire-v19-patches.metadata \
+            'sealed/aspire-v19-patches.enc.b64' \
+            sealed/aspire-v19-patches.key.enc.b64 v19.zip
+          decrypt_bundle v20 sealed/aspire-v20-trusted-yarp-patcher.metadata \
+            'sealed/aspire-v20-trusted-yarp-patcher.enc.b64.part-*' \
+            sealed/aspire-v20-trusted-yarp-patcher.key.enc.b64 v20.zip
+
+          mkdir -p audit/v19 audit/v20
+          unzip -q v19.zip -d audit/v19
+          unzip -q v20.zip -d audit/v20
+
+          echo '=== V19 PATCH_CHAIN.JSON ==='
+          python3 -m json.tool audit/v19/aspire-v19-patches/PATCH_CHAIN.json
+
+          python3 - <<'PY'
+          import ast, json
+          from pathlib import Path
+
+          def argv_index(node):
+              if isinstance(node, ast.Subscript):
+                  value=node.value
+                  if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name) and value.value.id=='sys' and value.attr=='argv':
+                      sl=node.slice
+                      if isinstance(sl, ast.Constant) and isinstance(sl.value, int):
+                          return sl.value
+              if isinstance(node, ast.Call) and node.args:
+                  for arg in node.args:
+                      idx=argv_index(arg)
+                      if idx is not None:
+                          return idx
+              return None
+
+          def target_name(node):
+              if isinstance(node, ast.Name):
+                  return node.id
+              if isinstance(node, (ast.Tuple, ast.List)):
+                  return [target_name(x) for x in node.elts]
+              if isinstance(node, ast.Attribute):
+                  return node.attr
+              return ast.dump(node, include_attributes=False)
+
+          for path in sorted(Path('audit').rglob('*.py')):
+              text=path.read_text(encoding='utf-8')
+              tree=ast.parse(text, filename=str(path))
+              assignments=[]
+              exits=[]
+              writes=[]
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Assign):
+                      idx=argv_index(node.value)
+                      if idx is not None:
+                          assignments.append({'targets':[target_name(t) for t in node.targets], 'argvIndex':idx, 'expr':ast.unparse(node.value)})
+                  elif isinstance(node, ast.AnnAssign):
+                      idx=argv_index(node.value) if node.value is not None else None
+                      if idx is not None:
+                          assignments.append({'targets':[target_name(node.target)], 'argvIndex':idx, 'expr':ast.unparse(node.value)})
+                  elif isinstance(node, ast.Call):
+                      name=ast.unparse(node.func)
+                      if name in {'Path.write_text','Path.write_bytes'} or name.endswith('.write_text') or name.endswith('.write_bytes') or name.endswith('.replace') or name.endswith('.copy') or name.endswith('.copy2'):
+                          writes.append(ast.unparse(node)[:500])
+                      if isinstance(node.func, ast.Name) and node.func.id=='SystemExit':
+                          exits.append(ast.unparse(node)[:500])
+                  elif isinstance(node, ast.Raise) and node.exc is not None:
+                      if isinstance(node.exc, ast.Call) and isinstance(node.exc.func, ast.Name) and node.exc.func.id=='SystemExit':
+                          exits.append(ast.unparse(node.exc)[:500])
+              print(f'=== ARGUMENT CONTRACT {path} ===')
+              print(json.dumps({'assignments':assignments,'systemExit':sorted(set(exits)),'writeCalls':writes[:30]}, indent=2, sort_keys=True))
+          PY
+
+          rm -rf wrapping.key private.pem v19.enc.b64.norm v19.enc v19.key.enc v19.key \
+            v20.enc.b64.norm v20.enc v20.key.enc v20.key v19.zip v20.zip audit
+          echo ARGUMENT_CONTRACT_AUDIT=PASS
