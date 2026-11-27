@@ -1,4 +1,5 @@
 name: Resolve Aspire v19-v20 patch argument contracts
+# trigger: argument-contract-r1
 
 on:
   push:
