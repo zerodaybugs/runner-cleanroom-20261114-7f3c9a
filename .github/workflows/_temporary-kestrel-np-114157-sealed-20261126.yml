@@ -118,7 +118,24 @@ jobs:
           if ($actualHash -ne $expectedHash) { throw 'payload script hash mismatch' }
 
           & pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $payloadPath
-          if ($LASTEXITCODE -ne 0) { throw "private validation failed: $LASTEXITCODE" }
+          $privateExit = $LASTEXITCODE
+          if ($privateExit -ne 0) {
+            Write-Host 'PRIVATE_VALIDATION_DIAGNOSTICS_BEGIN'
+            Get-ChildItem -LiteralPath $PWD -Directory -Filter 'evidence-*' | ForEach-Object {
+              $restoreLog = Join-Path $_.FullName 'restore.log'
+              $buildLog = Join-Path $_.FullName 'build.log'
+              if (Test-Path -LiteralPath $restoreLog) {
+                Write-Host '=== RESTORE LOG ==='
+                Get-Content -LiteralPath $restoreLog
+              }
+              if (Test-Path -LiteralPath $buildLog) {
+                Write-Host '=== BUILD LOG ==='
+                Get-Content -LiteralPath $buildLog
+              }
+            }
+            Write-Host 'PRIVATE_VALIDATION_DIAGNOSTICS_END'
+            throw "private validation failed: $privateExit"
+          }
           Write-Host 'SEALED_PRIVATE_VALIDATION_COMPLETE=1'
 
       - name: Seal private evidence
