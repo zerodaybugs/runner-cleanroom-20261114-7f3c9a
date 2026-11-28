@@ -1,0 +1,89 @@
+name: Validate Aspire v21 parallel lane patcher
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/_temporary-aspire-v21-parallel-static-gate-20261128.yml'
+      - 'scripts/aspire-v21-lane-selector.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sealed inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Reconstruct v20 and validate every partition
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test "$(git hash-object scripts/aspire-v21-lane-selector.py)" = "3b5656eb514011218127d38870e98ba95a70e446"
+          python3 -m py_compile scripts/aspire-v21-lane-selector.py
+
+          cp scripts/aspire-v20-patch-chain-gate.sh /tmp/aspire-v20-reconstruct.sh
+          python3 - /tmp/aspire-v20-reconstruct.sh <<'PY_KEEP'
+          from pathlib import Path
+          import sys
+          path=Path(sys.argv[1])
+          source=path.read_text()
+          old='trap cleanup EXIT\n'
+          if source.count(old)!=1:
+              raise SystemExit(f'cleanup trap count={source.count(old)}')
+          path.write_text(source.replace(old,'# cleanup deferred for v21 static gate\n',1))
+          PY_KEEP
+          chmod 700 /tmp/aspire-v20-reconstruct.sh
+          /tmp/aspire-v20-reconstruct.sh
+          test "$(sha256sum patched-v13/run.sh | awk '{print $1}')" = "55c6470e32a2ed5602ff0a450a587966ad6f40b9a5b88eb7a4d3514edf235906"
+          test "$(sha256sum patched-v13/browser.js | awk '{print $1}')" = "e9e33b5ef3a3f08779af526bd91fa633f0f52f2f4676d51eb8add2c4eeefbe"
+
+          mkdir -p v21-static
+          for lane in first_patched current_net10_revert current_net11 natural_fix; do
+            cp patched-v13/run.sh "v21-static/run-$lane.sh"
+            python3 scripts/aspire-v21-lane-selector.py \
+              "v21-static/run-$lane.sh" \
+              "$lane" \
+              "v21-static/receipt-$lane.json"
+            bash -n "v21-static/run-$lane.sh"
+            python3 -m json.tool "v21-static/receipt-$lane.json" >/dev/null
+            grep -Fq 'DEV_CERT_KEYCHAIN' "v21-static/run-$lane.sh"
+            grep -Fq 'security add-trusted-cert' "v21-static/run-$lane.sh"
+            grep -Fq '# V21 parallel lane:' "v21-static/run-$lane.sh"
+            if grep -Fq -- '--trust --format PEM' "v21-static/run-$lane.sh"; then
+              echo "interactive trust remains in $lane" >&2
+              exit 31
+            fi
+            if grep -Fq -- '--ignore-certificate-errors' "v21-static/run-$lane.sh"; then
+              echo "certificate bypass remains in $lane" >&2
+              exit 32
+            fi
+          done
+
+          python3 - <<'PY_ASSERT'
+          import json,pathlib
+          root=pathlib.Path('v21-static')
+          receipts=[json.load(open(p)) for p in sorted(root.glob('receipt-*.json'))]
+          assert {r['lane'] for r in receipts} == {'first_patched','current_net10_revert','current_net11','natural_fix'}
+          assert len({r['outputRunSha256'] for r in receipts}) == 4
+          for r in receipts:
+              assert r['inputRunSha256']=='55c6470e32a2ed5602ff0a450a587966ad6f40b9a5b88eb7a4d3514edf235906'
+          print(json.dumps(receipts,indent=2,sort_keys=True))
+          PY_ASSERT
+          echo V21_PARALLEL_STATIC_GATE=PASS
+
+      - name: Upload metadata-only receipts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aspire-v21-parallel-static-receipts
+          path: v21-static/receipt-*.json
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
