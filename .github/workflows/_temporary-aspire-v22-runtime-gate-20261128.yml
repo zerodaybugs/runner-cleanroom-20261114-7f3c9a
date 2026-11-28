@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/workflows/_temporary-aspire-v22-runtime-gate-20261128.yml'
       - 'scripts/aspire-v22-runtime-hardening.py'
+      - 'scripts/aspire-v22-retain-v21-gate.py'
   workflow_dispatch:
 
 permissions:
@@ -26,36 +27,20 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$WRAPPING_KEY_B64"
-          cp scripts/aspire-v21-patch-chain-gate.sh /tmp/aspire-v21-patch-chain-gate-retain.sh
+          python3 -m py_compile \
+            scripts/aspire-v22-retain-v21-gate.py \
+            scripts/aspire-v22-runtime-hardening.py
 
-          python3 - /tmp/aspire-v21-patch-chain-gate-retain.sh <<'PY_RETAIN'
-          from pathlib import Path
-          import sys
-
-          path = Path(sys.argv[1])
-          source = path.read_text()
-          anchor = "source = source_path.read_text()\n"
-          insertion = anchor + "if source.count('trap cleanup EXIT\\n') != 1:\n    raise SystemExit('generated cleanup trap count mismatch')\nsource = source.replace('trap cleanup EXIT\\n', '# cleanup deferred for v22 gate\\n', 1)\n"
-          if source.count(anchor) != 1:
-              raise SystemExit(f'generator source anchor count={source.count(anchor)}')
-          source = source.replace(anchor, insertion, 1)
-
-          checksum = '''test "$(sha256sum "$GENERATED" | awk '{print $1}')" = \\
-  848c6172d396b39493a2ec90651f31ddb19da7fb74f4d3fb16461072d422019d
-'''
-          if source.count(checksum) != 1:
-              raise SystemExit(f'generated checksum anchor count={source.count(checksum)}')
-          source = source.replace(checksum, 'sha256sum "$GENERATED"\n', 1)
-          path.write_text(source)
-          PY_RETAIN
-
+          cp scripts/aspire-v21-patch-chain-gate.sh \
+            /tmp/aspire-v21-patch-chain-gate-retain.sh
+          python3 scripts/aspire-v22-retain-v21-gate.py \
+            /tmp/aspire-v21-patch-chain-gate-retain.sh
           chmod 700 /tmp/aspire-v21-patch-chain-gate-retain.sh
           /tmp/aspire-v21-patch-chain-gate-retain.sh
 
           test -f patched-v13/run.sh
           test "$(sha256sum patched-v13/run.sh | awk '{print $1}')" = \
             'c8b83bbf3aa91ba91b73771cabea69c521cdbd7fe6f21beed84191bf8635da9a'
-          python3 -m py_compile scripts/aspire-v22-runtime-hardening.py
           python3 scripts/aspire-v22-runtime-hardening.py \
             patched-v13/run.sh v22-runtime-hardening-receipt.json
           bash -n patched-v13/run.sh
@@ -73,7 +58,8 @@ jobs:
             exit 32
           fi
 
-          printf 'V22_PATCHER_SHA256=%s\n' "$(sha256sum scripts/aspire-v22-runtime-hardening.py | awk '{print $1}')"
+          printf 'V22_RETAIN_PATCHER_SHA256=%s\n' "$(sha256sum scripts/aspire-v22-retain-v21-gate.py | awk '{print $1}')"
+          printf 'V22_RUNTIME_PATCHER_SHA256=%s\n' "$(sha256sum scripts/aspire-v22-runtime-hardening.py | awk '{print $1}')"
           printf 'V22_OUTPUT_RUN_SHA256=%s\n' "$(sha256sum patched-v13/run.sh | awk '{print $1}')"
           echo V22_RUNTIME_GATE=PASS
 
