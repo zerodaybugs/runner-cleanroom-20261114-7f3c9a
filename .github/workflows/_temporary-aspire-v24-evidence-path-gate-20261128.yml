@@ -1,0 +1,75 @@
+name: Gate Aspire v24 absolute evidence path hardening
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v24-evidence-path-gate-20261128.yml'
+      - 'scripts/aspire-v24-evidence-path-hardening.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  v24-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sealed clean-room inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Reconstruct v22 and gate v24 transform
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$WRAPPING_KEY_B64"
+          python3 -m py_compile \
+            scripts/aspire-v22-retain-v21-gate.py \
+            scripts/aspire-v22-runtime-hardening.py \
+            scripts/aspire-v24-evidence-path-hardening.py
+
+          cp scripts/aspire-v21-patch-chain-gate.sh /tmp/v21-retain.sh
+          python3 scripts/aspire-v22-retain-v21-gate.py /tmp/v21-retain.sh
+          chmod 700 /tmp/v21-retain.sh
+          /tmp/v21-retain.sh
+
+          test "$(sha256sum patched-v13/run.sh | awk '{print $1}')" = \
+            'c8b83bbf3aa91ba91b73771cabea69c521cdbd7fe6f21beed84191bf8635da9a'
+          python3 scripts/aspire-v22-runtime-hardening.py \
+            patched-v13/run.sh v22-receipt.json
+          test "$(sha256sum patched-v13/run.sh | awk '{print $1}')" = \
+            '15d852ebaab817a79954a0687d9dff18beb0efd6bd8c9a4dc44a2e426c40b2d7'
+
+          python3 scripts/aspire-v24-evidence-path-hardening.py \
+            patched-v13/run.sh v24-receipt.json
+          bash -n patched-v13/run.sh
+          node --check patched-v13/browser.js
+          python3 -m json.tool v24-receipt.json >/dev/null
+
+          grep -Fq 'EVIDENCE="${ZDB_EVIDENCE_DIR:-$PWD/evidence-aspire120006-macos-v24-runtime-smoke}"' patched-v13/run.sh
+          grep -Fq '*) EVIDENCE="$PWD/$EVIDENCE" ;;' patched-v13/run.sh
+          grep -Fq 'mkdir -p "$WORK" "$EVIDENCE"' patched-v13/run.sh
+          if grep -Fq -- '--ignore-certificate-errors' patched-v13/run.sh patched-v13/browser.js; then
+            echo 'forbidden Chromium certificate bypass remains' >&2
+            exit 31
+          fi
+          if grep -Fq 'ignoreHTTPSErrors: true' patched-v13/run.sh patched-v13/browser.js; then
+            echo 'forbidden Playwright certificate bypass remains' >&2
+            exit 32
+          fi
+
+          printf 'V24_PATCHER_SHA256=%s\n' "$(sha256sum scripts/aspire-v24-evidence-path-hardening.py | awk '{print $1}')"
+          printf 'V24_OUTPUT_RUN_SHA256=%s\n' "$(sha256sum patched-v13/run.sh | awk '{print $1}')"
+          echo V24_EVIDENCE_PATH_GATE=PASS
+
+      - name: Upload gate receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aspire-v24-evidence-path-gate
+          path: v24-receipt.json
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 9
