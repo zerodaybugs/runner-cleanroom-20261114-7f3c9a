@@ -1,4 +1,5 @@
 name: Validate temporary macOS keychain for Aspire TLS
+# trigger: bounded-security-commands-r2
 
 on:
   push:
@@ -36,6 +37,7 @@ jobs:
           PFX="$ROOT/aspire-devcert.pfx"
           CERT_PEM="$ROOT/aspire-devcert.crt"
           KEY_PEM="$ROOT/aspire-devcert.key"
+          LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
           mkdir -p "$ROOT"
 
           python3 - <<'PY_TIMEOUT_CLEAN'
@@ -52,14 +54,25 @@ jobs:
           test -s "$CERT_PEM"
           test -s "$KEY_PEM"
 
-          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security list-keychains -d user -s "$KEYCHAIN" "$HOME/Library/Keychains/login.keychain-db"
-          security default-keychain -d user -s "$KEYCHAIN"
-          security import "$PFX" -k "$KEYCHAIN" -P "$PFX_PASS" -A
-          security add-trusted-cert -d -r trustRoot -k "$KEYCHAIN" "$CERT_PEM"
-          security verify-cert -c "$CERT_PEM" -p ssl
+          python3 - "$KEYCHAIN" "$KEYCHAIN_PASS" "$PFX" "$PFX_PASS" "$CERT_PEM" "$LOGIN_KEYCHAIN" "$ROOT/security-commands.log" <<'PY_SECURITY'
+          import subprocess,sys
+          keychain,keychain_password,pfx,pfx_password,cert,login_keychain,log_path=sys.argv[1:]
+          commands=[
+              ['security','create-keychain','-p',keychain_password,keychain],
+              ['security','unlock-keychain','-p',keychain_password,keychain],
+              ['security','set-keychain-settings','-lut','21600',keychain],
+              ['security','list-keychains','-d','user','-s',keychain,login_keychain],
+              ['security','default-keychain','-d','user','-s',keychain],
+              ['security','import',pfx,'-k',keychain,'-P',pfx_password,'-A'],
+              ['security','add-trusted-cert','-d','-r','trustRoot','-k',keychain,cert],
+              ['security','verify-cert','-c',cert,'-p','ssl'],
+          ]
+          with open(log_path,'w',encoding='utf-8') as log:
+              for index,command in enumerate(commands,1):
+                  log.write(f'COMMAND_{index}={command[0]} {command[1]}\n')
+                  log.flush()
+                  subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=45)
+          PY_SECURITY
 
           mkdir -p "$ROOT/web"
           cd "$ROOT/web"
@@ -97,4 +110,5 @@ jobs:
           printf 'CERT_SHA256=%s\nPFX_SHA256=%s\n' \
             "$(shasum -a 256 "$CERT_PEM" | awk '{print $1}')" \
             "$(shasum -a 256 "$PFX" | awk '{print $1}')"
+          sed -n '1,120p' "$ROOT/security-commands.log"
           echo TEMP_KEYCHAIN_TLS_GATE=PASS
