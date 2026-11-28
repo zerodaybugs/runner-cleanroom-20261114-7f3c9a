@@ -1,0 +1,164 @@
+name: RFC3161 safe current-GA matrix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-rfc3161-safe-matrix-20261128.yml'
+      - 'research/rfc3161-safe-matrix/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  safe-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sealed source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install exact current-GA SDKs
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: |
+            10.0.404
+            11.0.100
+          cache: false
+
+      - name: Build and execute non-destructive matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          ROOT=research/rfc3161-safe-matrix
+          OUT=rfc3161-safe-results
+          mkdir -p "$OUT/net10" "$OUT/net11"
+
+          test "$(sha256sum "$ROOT/MatrixProgram.cs" | awk '{print $1}')" = \
+            'c4a7b6f13c26cb9e4667f1b8b978e48504ae1acf43c03829d6b0dee3eabd0c6f'
+
+          dotnet --list-sdks > "$OUT/dotnet-list-sdks.txt"
+          dotnet --list-runtimes > "$OUT/dotnet-list-runtimes.txt"
+          dotnet --info > "$OUT/dotnet-info-default.txt"
+          grep -Fxq '10.0.404' <(awk '{print $1}' "$OUT/dotnet-list-sdks.txt")
+          grep -Fxq '11.0.100' <(awk '{print $1}' "$OUT/dotnet-list-sdks.txt")
+          grep -Fq 'Microsoft.NETCore.App 10.0.15 ' "$OUT/dotnet-list-runtimes.txt"
+          grep -Fq 'Microsoft.NETCore.App 11.0.0 ' "$OUT/dotnet-list-runtimes.txt"
+
+          (
+            cd "$ROOT/app10"
+            dotnet --version | tee "$GITHUB_WORKSPACE/$OUT/net10/sdk-version.txt"
+            test "$(dotnet --version)" = '10.0.404'
+            dotnet restore --force-evaluate --nologo > "$GITHUB_WORKSPACE/$OUT/net10/restore.log" 2>&1
+            dotnet build -c Release --no-restore --nologo > "$GITHUB_WORKSPACE/$OUT/net10/build.log" 2>&1
+            for i in 1 2 3; do
+              dotnet bin/Release/net10.0/Matrix10.dll > "$GITHUB_WORKSPACE/$OUT/net10/run-$i.json"
+            done
+          )
+
+          (
+            cd "$ROOT/app11"
+            dotnet --version | tee "$GITHUB_WORKSPACE/$OUT/net11/sdk-version.txt"
+            test "$(dotnet --version)" = '11.0.100'
+            dotnet restore --force-evaluate --nologo > "$GITHUB_WORKSPACE/$OUT/net11/restore.log" 2>&1
+            dotnet build -c Release --no-restore --nologo > "$GITHUB_WORKSPACE/$OUT/net11/build.log" 2>&1
+            for i in 1 2 3; do
+              dotnet bin/Release/net11.0/Matrix11.dll > "$GITHUB_WORKSPACE/$OUT/net11/run-$i.json"
+            done
+          )
+
+          python3 - "$OUT" "$GITHUB_SHA" <<'PY_VALIDATE'
+          import hashlib, json, pathlib, statistics, sys
+          out=pathlib.Path(sys.argv[1]); commit=sys.argv[2]
+          expected={
+              'net10': {
+                  'framework': '.NET 10.0.15',
+                  'sdkTarget': '.NETCoreApp,Version=v10.0',
+                  'assemblyVersion': 'Version=10.0.0.0',
+                  'productPrefix': '10.0.15+',
+              },
+              'net11': {
+                  'framework': '.NET 11.0.0',
+                  'sdkTarget': '.NETCoreApp,Version=v11.0',
+                  'assemblyVersion': 'Version=11.0.0.0',
+                  'productPrefix': '11.0.0+',
+              },
+          }
+          summary={'schema':1,'commit':commit,'destructiveOomExecuted':False,'lanes':{}}
+          for lane, exp in expected.items():
+              runs=[]
+              for i in range(1,4):
+                  p=out/lane/f'run-{i}.json'
+                  data=json.loads(p.read_text())
+                  assert data['framework']==exp['framework'], data['framework']
+                  assert data['sdkTarget']==exp['sdkTarget'], data['sdkTarget']
+                  assert data['pkcsAssembly'].startswith('System.Security.Cryptography.Pkcs, ')
+                  assert exp['assemblyVersion'] in data['pkcsAssembly']
+                  assert data['pkcsProductVersion'].startswith(exp['productPrefix']), data['pkcsProductVersion']
+                  assert data['attackCount']==500000
+                  assert data['attackInputBytes']==data['controlInputBytes']
+                  assert data['sameSize'] is True
+                  assert data['uniqueExtensionOids'] is True
+                  assert data['stockAttack']['Accepted'] is True
+                  assert data['stockAttack']['ExtensionCount']==500000
+                  assert data['stockAttack']['AllocatedBytes']>=80_000_000
+                  assert data['stockControl']['Accepted'] is True
+                  assert data['stockControl']['ExtensionCount']==1
+                  assert data['allocationRatio']>=15.0
+                  assert data['fixedAttack']['Accepted'] is False
+                  assert data['fixedAttack']['RejectedByLimit'] is True
+                  assert data['fixedAttack']['ExtensionCount']==1025
+                  assert data['fixedAttack']['AllocatedBytes']<5_000_000
+                  assert data['fixedControl']['Accepted'] is True
+                  assert data['unlimitedAttack']['Accepted'] is True
+                  assert data['unlimitedAttack']['ExtensionCount']==500000
+                  assert data['boundary']=={'max':1024,'accepted1024':True,'accepted1025':False,'count1024':1024,'count1025':1025}
+                  assert all(v==1 for v in data['markers'].values()), data['markers']
+                  assert data['verdict']=='PASS'
+                  runs.append(data)
+              ratios=[r['allocationRatio'] for r in runs]
+              summary['lanes'][lane]={
+                  'framework':runs[0]['framework'],
+                  'sdkTarget':runs[0]['sdkTarget'],
+                  'pkcsProductVersion':runs[0]['pkcsProductVersion'],
+                  'inputBytes':runs[0]['attackInputBytes'],
+                  'runs':3,
+                  'verdicts':[r['verdict'] for r in runs],
+                  'allocationRatioMin':min(ratios),
+                  'allocationRatioMedian':statistics.median(ratios),
+                  'allocationRatioMax':max(ratios),
+                  'stockAttackAllocatedBytes':[r['stockAttack']['AllocatedBytes'] for r in runs],
+                  'fixedAttackAllocatedBytes':[r['fixedAttack']['AllocatedBytes'] for r in runs],
+              }
+          source=pathlib.Path('research/rfc3161-safe-matrix/MatrixProgram.cs')
+          summary['sourceSha256']=hashlib.sha256(source.read_bytes()).hexdigest()
+          summary['overall']='PASS'
+          (out/'CURRENT_GA_SAFE_MATRIX_RECEIPT.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          PY_VALIDATE
+
+          python3 - "$OUT" <<'PY_HASH'
+          import hashlib, pathlib, sys
+          root=pathlib.Path(sys.argv[1]); lines=[]
+          for p in sorted(root.rglob('*')):
+              if p.is_file() and p.name!='SHA256SUMS.txt':
+                  lines.append(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(root)}')
+          (root/'SHA256SUMS.txt').write_text('\n'.join(lines)+'\n')
+          PY_HASH
+
+          if grep -RInaE --binary-files=without-match \
+            'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|Authorization:[[:space:]]*(Bearer|Basic)[[:space:]]+[A-Za-z0-9._~+/=-]{12,}|Cookie:[[:space:]]*[^<]|Set-Cookie:[[:space:]]*[^<]|github_pat_|ghp_|sk-[A-Za-z0-9_-]{20,}' "$OUT"; then
+            echo RFC3161_SAFE_MATRIX_SECRET_SCAN=FAIL >&2
+            exit 91
+          fi
+          echo RFC3161_SAFE_MATRIX_SECRET_SCAN=PASS
+
+      - name: Upload safe current-GA evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rfc3161-safe-current-ga-matrix-20261128
+          path: rfc3161-safe-results
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
