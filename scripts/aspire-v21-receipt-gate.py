@@ -26,12 +26,20 @@ def main() -> None:
     hashes = {receipt.get("outputRunSha256") for receipt in receipts}
     if len(hashes) != len(EXPECTED_LANES):
         raise SystemExit("partition output hashes are not unique")
+    evidence_directories = set()
     for receipt in receipts:
         lane = receipt.get("lane")
         if receipt.get("inputRunSha256") != EXPECTED_INPUT_SHA256:
             raise SystemExit(f"unexpected input hash for {lane}")
-        if receipt.get("schema") != 2:
+        if receipt.get("schema") != 3:
             raise SystemExit(f"unexpected schema for {lane}")
+        expected_evidence = f"evidence-aspire120006-macos-v21-{lane}"
+        if receipt.get("evidenceDirectory") != expected_evidence:
+            raise SystemExit(f"unexpected evidence directory for {lane}")
+        evidence_directories.add(expected_evidence)
+        original_assignment = receipt.get("originalEvidenceAssignment")
+        if not isinstance(original_assignment, str) or not original_assignment.startswith("EVIDENCE="):
+            raise SystemExit(f"missing original evidence assignment for {lane}")
         trust = receipt.get("certificateTrust") or {}
         if trust.get("store") != "/Library/Keychains/System.keychain":
             raise SystemExit(f"unexpected trust store for {lane}")
@@ -41,6 +49,8 @@ def main() -> None:
             raise SystemExit(f"browser trust bypass detected for {lane}")
         if trust.get("validatedByRunId") != 46173931175:
             raise SystemExit(f"unvalidated certificate method for {lane}")
+    if len(evidence_directories) != len(EXPECTED_LANES):
+        raise SystemExit("evidence directories are not unique")
     print(json.dumps(receipts, indent=2, sort_keys=True))
 
 
