@@ -1,5 +1,5 @@
 name: Validate Aspire v21 parallel lane patcher
-# trigger: stable-script-r4
+# trigger: complete-current-scripts-r5
 
 on:
   push:
