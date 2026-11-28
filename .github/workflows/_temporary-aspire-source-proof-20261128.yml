@@ -62,7 +62,7 @@ jobs:
 
           python3 - source-proof "$FIRST_PATCHED_COMMIT" "$CURRENT_COMMIT" "$FIX_COMMIT" <<'PY_PROOF'
           from __future__ import annotations
-          import hashlib, json, pathlib, re, sys
+          import hashlib, json, pathlib, sys
 
           root=pathlib.Path(sys.argv[1])
           first,current,fix=sys.argv[2:]
@@ -176,7 +176,7 @@ jobs:
           grep -Fq 'Legacy (no tunnel) mode' source-proof/excerpts/current-legacy-all-host-endpoints.txt
           grep -Fq 'EnableAspireContainerTunnel' source-proof/excerpts/first-tunnel-enabled-dashboard-filter.txt
           grep -Fq 'EnableAspireContainerTunnel' source-proof/excerpts/current-tunnel-enabled-dashboard-filter.txt
-          sha256sum -c source-proof/SHA256SUMS.txt
+          (cd source-proof && sha256sum -c SHA256SUMS.txt)
           echo ASPIRE_SOURCE_PROOF=PASS
 
       - name: Upload source provenance proof
