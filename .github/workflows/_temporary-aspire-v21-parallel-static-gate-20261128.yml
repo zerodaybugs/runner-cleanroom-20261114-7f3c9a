@@ -1,4 +1,5 @@
 name: Validate Aspire v21 parallel lane patcher
+# trigger: export-before-cleanup-r2
 
 on:
   push:
@@ -25,29 +26,33 @@ jobs:
         env:
           WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           test "$(git hash-object scripts/aspire-v21-lane-selector.py)" = "3b5656eb514011218127d38870e98ba95a70e446"
           python3 -m py_compile scripts/aspire-v21-lane-selector.py
 
           cp scripts/aspire-v20-patch-chain-gate.sh /tmp/aspire-v20-reconstruct.sh
-          python3 - /tmp/aspire-v20-reconstruct.sh <<'PY_KEEP'
+          python3 - /tmp/aspire-v20-reconstruct.sh <<'PY_EXPORT'
           from pathlib import Path
           import sys
           path=Path(sys.argv[1])
           source=path.read_text()
-          old='trap cleanup EXIT\n'
+          old="echo V20_PATCH_CHAIN_GATE=PASS\n"
+          new='''mkdir -p "$V21_EXPORT_DIR"\ncp "$RUN" "$V21_EXPORT_DIR/run.sh"\ncp "$BROWSER" "$V21_EXPORT_DIR/browser.js"\necho V20_PATCH_CHAIN_GATE=PASS\n'''
           if source.count(old)!=1:
-              raise SystemExit(f'cleanup trap count={source.count(old)}')
-          path.write_text(source.replace(old,'# cleanup deferred for v21 static gate\n',1))
-          PY_KEEP
+              raise SystemExit(f'export anchor count={source.count(old)}')
+          path.write_text(source.replace(old,new,1))
+          PY_EXPORT
           chmod 700 /tmp/aspire-v20-reconstruct.sh
+          export V21_EXPORT_DIR="$PWD/v20-export"
           /tmp/aspire-v20-reconstruct.sh
-          test "$(sha256sum patched-v13/run.sh | awk '{print $1}')" = "55c6470e32a2ed5602ff0a450a587966ad6f40b9a5b88eb7a4d3514edf235906"
-          test "$(sha256sum patched-v13/browser.js | awk '{print $1}')" = "e9e33b5ef3a3f08779af526bd91fa633f0f52f2f4676d51eb8add2c4eeefbe"
+          test -f v20-export/run.sh
+          test -f v20-export/browser.js
+          test "$(sha256sum v20-export/run.sh | awk '{print $1}')" = "55c6470e32a2ed5602ff0a450a587966ad6f40b9a5b88eb7a4d3514edf235906"
+          test "$(sha256sum v20-export/browser.js | awk '{print $1}')" = "e9e33b5ef3a3f08779af526bd91fa633f0f52f2f4676d51eb8add2c4eeefbe"
 
           mkdir -p v21-static
           for lane in first_patched current_net10_revert current_net11 natural_fix; do
-            cp patched-v13/run.sh "v21-static/run-$lane.sh"
+            cp v20-export/run.sh "v21-static/run-$lane.sh"
             python3 scripts/aspire-v21-lane-selector.py \
               "v21-static/run-$lane.sh" \
               "$lane" \
