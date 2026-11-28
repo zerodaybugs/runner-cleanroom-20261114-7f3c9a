@@ -139,7 +139,7 @@ fi
         die("lane replacement count mismatch")
     if "--ignore-certificate-errors" in source:
         die("forbidden Chromium trust bypass present")
-    if "sudo -n security add-trusted-cert" not in source:
+    if "['sudo','-n','security','add-trusted-cert'" not in source:
         die("validated system-keychain trust command missing")
 
     output = source.encode("utf-8")
