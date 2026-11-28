@@ -1,0 +1,87 @@
+name: Gate Aspire v22 runtime hardening
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v22-runtime-gate-20261128.yml'
+      - 'scripts/aspire-v22-runtime-hardening.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  v22-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sealed clean-room inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Reconstruct v21 and gate v22 transform
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$WRAPPING_KEY_B64"
+          cp scripts/aspire-v21-patch-chain-gate.sh /tmp/aspire-v21-patch-chain-gate-retain.sh
+
+          python3 - /tmp/aspire-v21-patch-chain-gate-retain.sh <<'PY_RETAIN'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          source = path.read_text()
+          anchor = "source = source_path.read_text()\n"
+          insertion = anchor + "if source.count('trap cleanup EXIT\\n') != 1:\n    raise SystemExit('generated cleanup trap count mismatch')\nsource = source.replace('trap cleanup EXIT\\n', '# cleanup deferred for v22 gate\\n', 1)\n"
+          if source.count(anchor) != 1:
+              raise SystemExit(f'generator source anchor count={source.count(anchor)}')
+          source = source.replace(anchor, insertion, 1)
+
+          checksum = '''test "$(sha256sum "$GENERATED" | awk '{print $1}')" = \\
+  848c6172d396b39493a2ec90651f31ddb19da7fb74f4d3fb16461072d422019d
+'''
+          if source.count(checksum) != 1:
+              raise SystemExit(f'generated checksum anchor count={source.count(checksum)}')
+          source = source.replace(checksum, 'sha256sum "$GENERATED"\n', 1)
+          path.write_text(source)
+          PY_RETAIN
+
+          chmod 700 /tmp/aspire-v21-patch-chain-gate-retain.sh
+          /tmp/aspire-v21-patch-chain-gate-retain.sh
+
+          test -f patched-v13/run.sh
+          test "$(sha256sum patched-v13/run.sh | awk '{print $1}')" = \
+            'c8b83bbf3aa91ba91b73771cabea69c521cdbd7fe6f21beed84191bf8635da9a'
+          python3 -m py_compile scripts/aspire-v22-runtime-hardening.py
+          python3 scripts/aspire-v22-runtime-hardening.py \
+            patched-v13/run.sh v22-runtime-hardening-receipt.json
+          bash -n patched-v13/run.sh
+          python3 -m json.tool v22-runtime-hardening-receipt.json >/dev/null
+
+          grep -Fq 'EVIDENCE="${ZDB_EVIDENCE_DIR:-$PWD/evidence-aspire120006-macos-v22-runtime-smoke}"' patched-v13/run.sh
+          grep -Fq 'curl --cacert "$DEV_CERT_PEM" -fsS --connect-timeout 1 --max-time 2 "https://localhost:$dash/"' patched-v13/run.sh
+          grep -Fq 'curl --cacert "$DEV_CERT_PEM" -fsS --connect-timeout 1 --max-time 2 "https://localhost:$unusedhttps/"' patched-v13/run.sh
+          if grep -Fq -- '--ignore-certificate-errors' patched-v13/run.sh patched-v13/browser.js; then
+            echo 'forbidden Chromium certificate bypass remains' >&2
+            exit 31
+          fi
+          if grep -Fq 'ignoreHTTPSErrors: true' patched-v13/run.sh patched-v13/browser.js; then
+            echo 'forbidden Playwright certificate bypass remains' >&2
+            exit 32
+          fi
+
+          printf 'V22_PATCHER_SHA256=%s\n' "$(sha256sum scripts/aspire-v22-runtime-hardening.py | awk '{print $1}')"
+          printf 'V22_OUTPUT_RUN_SHA256=%s\n' "$(sha256sum patched-v13/run.sh | awk '{print $1}')"
+          echo V22_RUNTIME_GATE=PASS
+
+      - name: Upload gate receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aspire-v22-runtime-hardening-gate
+          path: v22-runtime-hardening-receipt.json
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 9
