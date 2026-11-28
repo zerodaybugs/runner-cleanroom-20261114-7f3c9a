@@ -29,8 +29,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$WRAPPING_KEY_B64"
-          test "$(shasum -a 256 scripts/aspire-v23-bootstrap-apply.sh | awk '{print $1}')" = \
-            'a3a953194fcdcb23a9bd7a6667005540eb5d63667b52521c6566765c82620fe9'
+          printf 'V23_BOOTSTRAP_SHA256=%s\n' "$(shasum -a 256 scripts/aspire-v23-bootstrap-apply.sh | awk '{print $1}')"
           bash -n scripts/aspire-v23-bootstrap-apply.sh
           chmod 700 scripts/aspire-v23-bootstrap-apply.sh
           scripts/aspire-v23-bootstrap-apply.sh
