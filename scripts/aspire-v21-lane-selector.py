@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -133,6 +134,20 @@ fi
     }
     source = source[:start] + lane_blocks[lane] + source[end:]
 
+    evidence_directory = f"evidence-aspire120006-macos-v21-{lane}"
+    lines = source.splitlines(keepends=True)
+    evidence_assignments = [index for index, line in enumerate(lines) if re.match(r"^EVIDENCE=", line)]
+    if len(evidence_assignments) != 1:
+        die(f"EVIDENCE assignment count={len(evidence_assignments)}")
+    evidence_index = evidence_assignments[0]
+    old_evidence_assignment = lines[evidence_index].rstrip("\r\n")
+    line_ending = "\r\n" if lines[evidence_index].endswith("\r\n") else "\n"
+    if "$ROOT_DIR/" in old_evidence_assignment:
+        lines[evidence_index] = f'EVIDENCE="$ROOT_DIR/{evidence_directory}"{line_ending}'
+    else:
+        lines[evidence_index] = f'EVIDENCE="{evidence_directory}"{line_ending}'
+    source = "".join(lines)
+
     if "--trust --format PEM" in source:
         die("interactive dev-certs trust flag remains")
     if source.count("V21 parallel lane:") != 1:
@@ -141,16 +156,20 @@ fi
         die("forbidden Chromium trust bypass present")
     if "['sudo','-n','security','add-trusted-cert'" not in source:
         die("validated system-keychain trust command missing")
+    if source.count(evidence_directory) < 1:
+        die("lane evidence directory missing")
 
     output = source.encode("utf-8")
     run_path.write_bytes(output)
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
     receipt = {
-        "schema": 2,
+        "schema": 3,
         "lane": lane,
-        "scope": "CI partitioning and noninteractive macOS System.keychain trust only; product source, browser exploit logic, security assertions, and fix semantics unchanged",
+        "scope": "CI partitioning, isolated evidence routing, and noninteractive macOS System.keychain trust only; product source, browser exploit logic, security assertions, and fix semantics unchanged",
         "inputRunSha256": before_sha,
         "outputRunSha256": sha256_bytes(output),
+        "evidenceDirectory": evidence_directory,
+        "originalEvidenceAssignment": old_evidence_assignment,
         "certificateTrust": {
             "store": "/Library/Keychains/System.keychain",
             "addCommand": "sudo -n security add-trusted-cert",
@@ -161,6 +180,7 @@ fi
             "replace interactive dotnet dev-certs --trust with bounded PFX export",
             "mark the exported public development certificate trusted in the macOS System.keychain using passwordless sudo",
             "select exactly one independent residual lane group per macOS job",
+            "route all runtime evidence to a lane-specific canonical directory",
             "preserve stock Dashboard navigation, cookie replay, lifecycle sink, natural-fix assertion, and stock-revert assertion",
         ],
     }
