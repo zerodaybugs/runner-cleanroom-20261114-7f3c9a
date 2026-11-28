@@ -1,0 +1,155 @@
+name: Diagnose Aspire v22 smoke patch-chain failure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v22-smoke-diagnose-20261128.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  diagnose-v22-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sealed inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Decrypt and emit redacted decision evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          SOURCE_RUN_ID: '46125934262'
+          SOURCE_ARTIFACT_ID: '15255574222'
+          SOURCE_SHA: '341f1af11a525f760fc60d68ccb08485ed365285'
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p work/artifact work/raw
+
+          printf '%s' "$WRAPPING_KEY_B64" | openssl base64 -d -A > work/wrapping.key
+          test "$(wc -c < work/wrapping.key | tr -d ' ')" = 32
+          WRAP_KEY_HEX="$(od -An -tx1 -v work/wrapping.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc \
+            -K "$WRAP_KEY_HEX" \
+            -iv "$(tr -d '\r\n ' < bootstrap/private.iv.hex)" \
+            -in bootstrap/private.pem.enc \
+            -out work/private.pem
+
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v2.key.enc.b64 | \
+            openssl base64 -d -A > work/payload.key.enc
+          openssl pkeyutl -decrypt \
+            -inkey work/private.pem \
+            -in work/payload.key.enc \
+            -out work/matrix.runtime.key \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -pkeyopt rsa_mgf1_md:sha256
+          test "$(wc -c < work/matrix.runtime.key | tr -d ' ')" = 32
+
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$SOURCE_ARTIFACT_ID/zip" \
+            -o work/artifact.zip
+          unzip -q work/artifact.zip -d work/artifact
+          grep -qx "RUN_ID=$SOURCE_RUN_ID" work/artifact/metadata.txt
+          grep -qx "SOURCE_SHA=$SOURCE_SHA" work/artifact/metadata.txt
+          grep -qx 'EVIDENCE_CIPHER_PRESENT=1' work/artifact/metadata.txt
+          test "$(sha256sum work/artifact/evidence.enc | awk '{print $1}')" = \
+            "$(tr -d '\r\n ' < work/artifact/evidence.cipher.sha256)"
+
+          KEY_HEX="$(od -An -tx1 -v work/matrix.runtime.key | tr -d ' \n')"
+          openssl enc -d -aes-256-cbc \
+            -K "$KEY_HEX" \
+            -iv "$(tr -d '\r\n ' < work/artifact/evidence.iv.hex)" \
+            -in work/artifact/evidence.enc \
+            -out work/evidence.plain.zip
+          test "$(sha256sum work/evidence.plain.zip | awk '{print $1}')" = \
+            "$(tr -d '\r\n ' < work/artifact/evidence.plain.sha256)"
+          unzip -q work/evidence.plain.zip -d work/raw
+
+          python3 - work/raw work/artifact/metadata.txt <<'PY_DIAG'
+          import pathlib, re, sys
+
+          raw_root = pathlib.Path(sys.argv[1])
+          metadata = pathlib.Path(sys.argv[2])
+          roots = [p for p in raw_root.iterdir() if p.is_dir()]
+          if len(roots) != 1:
+              raise SystemExit(f'expected one evidence root, got {len(roots)}')
+          root = roots[0]
+
+          private_key = re.compile(
+              r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?'
+              r'-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----', re.I | re.S)
+          substitutions = [
+              (re.compile(r'([?&](?:t|token|access_token|code)=)[^&\s"\']+', re.I), r'\1<REDACTED>'),
+              (re.compile(r'(?im)^(\s*\+?\s*(?:ASPIRE_DASHBOARD_FRONTEND_BROWSERTOKEN|PAYLOAD_KEY_B64|WRAPPING_KEY_B64)=).+$'), r'\1<REDACTED>'),
+              (re.compile(r'(?im)^((?:authorization|proxy-authorization)\s*:\s*).+$'), r'\1<REDACTED>'),
+              (re.compile(r'(?im)^((?:cookie|set-cookie)\s*:\s*).+$'), r'\1<REDACTED>'),
+              (re.compile(r'(?im)^((?:x-otlp-api-key|x-api-key)\s*:\s*).+$'), r'\1<REDACTED>'),
+              (re.compile(r'(?i)(\.Aspire\.Dashboard\.Auth[^=;\s"\']*=)[^;\s"\']+'), r'\1<REDACTED>'),
+              (re.compile(r'(?i)(\.AspNetCore\.[A-Za-z0-9_.-]+=)[^;\s"\']+'), r'\1<REDACTED>'),
+              (re.compile(r'(?i)(browser_token[=:]\s*)[^\s"\']+'), r'\1<REDACTED>'),
+          ]
+
+          def redact(text):
+              text = private_key.sub('<PRIVATE_KEY_REDACTED>', text)
+              for pattern, replacement in substitutions:
+                  text = pattern.sub(replacement, text)
+              return text
+
+          print('=== CI METADATA ===')
+          print(redact(metadata.read_text(errors='replace')))
+          print('=== EVIDENCE TREE ===')
+          for path in sorted(root.rglob('*')):
+              if path.is_file():
+                  print(f'{path.stat().st_size:>12}  {path.relative_to(root)}')
+
+          exact = {
+              'workflow-status.txt','status.txt','assertion.txt','readiness.txt',
+              'executed-run-hashes.txt','fix-build-status.txt','revert-status.txt',
+              'browser-result.json','dcp-scope-assertion.json','post-browser-health.json',
+              'HARNESS_V16_PATCH.json','HARNESS_V18_DIRECT_PATCH.json',
+              'HARNESS_V20_PATCH.stdout','HARNESS_V20_PATCH.stderr','HARNESS_V20_PATCH.json',
+              'HARNESS_V21_PATCH.stdout','HARNESS_V21_PATCH.stderr','HARNESS_V21_PATCH.json',
+              'HARNESS_V22_PATCH.stdout','HARNESS_V22_PATCH.stderr','HARNESS_V22_PATCH.json',
+              'build.log','fix-build.log','apphost-tail.txt','browser.stderr','browser.stdout',
+              'patch-v11.stdout','patch-v11.stderr','patch-v13.stdout','patch-v13.stderr'
+          }
+          print('=== DECISION FILES ===')
+          for path in sorted(root.rglob('*')):
+              if not path.is_file() or path.name not in exact or path.stat().st_size > 4_000_000:
+                  continue
+              data = path.read_bytes()
+              if b'\x00' in data[:8192]:
+                  continue
+              print(f'--- {path.relative_to(root)} ---')
+              print(redact(data.decode('utf-8', errors='replace'))[:120000])
+
+          trace = next(iter(root.rglob('bootstrap-trace.log')), None)
+          if trace and trace.stat().st_size <= 16_000_000:
+              text = redact(trace.read_text(errors='replace'))
+              lines = text.splitlines()
+              marker = re.compile(
+                  r'(HARNESS_V20|HARNESS_V21|HARNESS_V22|run_lane|current_17|natural_fix|status|'
+                  r'assertion|readiness|dashboard|apphost|yarp|proxyless|cookie|replay|lifecycle|'
+                  r'timeout|failed|error|exception|cancel|MATRIX_RC|certificate|keychain|msbuild|'
+                  r'build|exit [1-9]|return [1-9])', re.I)
+              chosen = lines[:240] + [line for line in lines if marker.search(line)] + lines[-1200:]
+              seen, compact = set(), []
+              for line in chosen:
+                  if line not in seen:
+                      compact.append(line); seen.add(line)
+              print('=== REDACTED BOOTSTRAP TRACE ===')
+              print('\n'.join(compact[:6000]))
+          PY_DIAG
+
+          rm -rf work
+          echo V22_SMOKE_DIAGNOSIS_EXPORT=PASS
