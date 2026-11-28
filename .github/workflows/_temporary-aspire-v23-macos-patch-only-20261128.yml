@@ -1,0 +1,61 @@
+name: Aspire v23 macOS patch-only gate
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v23-macos-patch-only-20261128.yml'
+      - 'scripts/aspire-v23-bootstrap-apply.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  patch-only:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sealed clean-room inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Execute instrumented patch chain only
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          ZDB_PATCH_ONLY: '1'
+          ZDB_MATRIX_PROFILE: smoke
+          ZDB_EVIDENCE_DIR: evidence-aspire120006-macos-v23-patch-only
+        run: |
+          set -euo pipefail
+          test -n "$WRAPPING_KEY_B64"
+          test "$(shasum -a 256 scripts/aspire-v23-bootstrap-apply.sh | awk '{print $1}')" = \
+            'a3a953194fcdcb23a9bd7a6667005540eb5d63667b52521c6566765c82620fe9'
+          bash -n scripts/aspire-v23-bootstrap-apply.sh
+          chmod 700 scripts/aspire-v23-bootstrap-apply.sh
+          scripts/aspire-v23-bootstrap-apply.sh
+
+          EVIDENCE=evidence-aspire120006-macos-v23-patch-only
+          test -f "$EVIDENCE/PATCH_CHAIN_CHECKPOINTS.txt"
+          grep -qx 'PATCH_CHAIN_STATUS=PASS' "$EVIDENCE/PATCH_CHAIN_CHECKPOINTS.txt"
+          grep -q '^V22_RUN_ACTUAL=15d852ebaab817a79954a0687d9dff18beb0efd6bd8c9a4dc44a2e426c40b2d7$' "$EVIDENCE/PATCH_CHAIN_CHECKPOINTS.txt"
+          grep -q '^V22_BROWSER_ACTUAL=a5553a24a95f9bd1b4f340e5acdcd6ee8d63588d875700ce0024ed659005351e$' "$EVIDENCE/PATCH_CHAIN_CHECKPOINTS.txt"
+          cat "$EVIDENCE/PATCH_CHAIN_CHECKPOINTS.txt"
+          cat "$EVIDENCE/executed-run-hashes.txt"
+          echo V23_MACOS_PATCH_ONLY=PASS
+
+      - name: Upload metadata-only patch receipts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aspire-v23-macos-patch-only-receipts
+          path: |
+            evidence-aspire120006-macos-v23-patch-only/PATCH_CHAIN_CHECKPOINTS.txt
+            evidence-aspire120006-macos-v23-patch-only/executed-run-hashes.txt
+            evidence-aspire120006-macos-v23-patch-only/HARNESS_V16_PATCH.json
+            evidence-aspire120006-macos-v23-patch-only/HARNESS_V18_DIRECT_PATCH.json
+            evidence-aspire120006-macos-v23-patch-only/HARNESS_V20_PATCH.json
+            evidence-aspire120006-macos-v23-patch-only/HARNESS_V21_PATCH.json
+            evidence-aspire120006-macos-v23-patch-only/HARNESS_V22_PATCH.json
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 9
