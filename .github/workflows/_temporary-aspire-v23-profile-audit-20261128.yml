@@ -1,0 +1,70 @@
+name: Audit Aspire v23 profile lanes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v23-profile-audit-20261128.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sealed clean-room inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Reconstruct final v22 run and audit lane selection
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            scripts/aspire-v22-retain-v21-gate.py \
+            scripts/aspire-v22-runtime-hardening.py
+
+          cp scripts/aspire-v21-patch-chain-gate.sh /tmp/v21-retain.sh
+          python3 scripts/aspire-v22-retain-v21-gate.py /tmp/v21-retain.sh
+          chmod 700 /tmp/v21-retain.sh
+          /tmp/v21-retain.sh
+
+          test "$(sha256sum patched-v13/run.sh | awk '{print $1}')" = \
+            'c8b83bbf3aa91ba91b73771cabea69c521cdbd7fe6f21beed84191bf8635da9a'
+          python3 scripts/aspire-v22-runtime-hardening.py \
+            patched-v13/run.sh v22-profile-audit-receipt.json
+          test "$(sha256sum patched-v13/run.sh | awk '{print $1}')" = \
+            '15d852ebaab817a79954a0687d9dff18beb0efd6bd8c9a4dc44a2e426c40b2d7'
+
+          python3 - patched-v13/run.sh <<'PY_AUDIT'
+          from pathlib import Path
+          import re, sys
+
+          path = Path(sys.argv[1])
+          lines = path.read_text().splitlines()
+          pattern = re.compile(
+              r'ZDB_MATRIX_PROFILE|PROFILE|run_lane|first_patched_13_6_5|current_17_0_0|'
+              r'natural_fix|revert_stock|matrix_rc|smoke|full', re.I)
+          chosen = []
+          seen = set()
+          for i, line in enumerate(lines):
+              if pattern.search(line):
+                  for j in range(max(0, i - 3), min(len(lines), i + 4)):
+                      if j not in seen:
+                          seen.add(j)
+                          chosen.append((j + 1, lines[j]))
+          for number, line in sorted(chosen):
+              print(f'{number:05d}: {line}')
+          PY_AUDIT
+
+          grep -Fq 'ZDB_MATRIX_PROFILE' patched-v13/run.sh
+          grep -Fq 'first_patched_13_6_5_legacy' patched-v13/run.sh
+          grep -Fq 'current_17_0_0_legacy' patched-v13/run.sh
+          grep -Fq 'current_17_0_0_net11_legacy' patched-v13/run.sh
+          grep -Fq 'current_17_0_0_legacy_natural_fix' patched-v13/run.sh
+          grep -Fq 'current_17_0_0_legacy_revert_stock' patched-v13/run.sh
+          echo V23_PROFILE_AUDIT=PASS
