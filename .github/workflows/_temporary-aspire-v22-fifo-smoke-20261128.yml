@@ -1,161 +1,103 @@
-name: Aspire v22 FIFO current-lane smoke
+name: Aspire v22 launch and readiness code inspection
 
 on:
   push:
     branches: [main]
     paths:
       - '.github/workflows/_temporary-aspire-v22-fifo-smoke-20261128.yml'
-      - 'scripts/aspire-v22-fifo-cli-harness.py'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  current-lane-smoke:
-    runs-on: macos-15
-    timeout-minutes: 35
+  export-excerpts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout sealed inputs
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
-      - name: Install exact .NET SDK
-        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
-        with:
-          dotnet-version: 10.0.404
-          cache: false
-
-      - name: Install software-virtualized container runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          brew install docker qemu colima
-          colima start --vm-type qemu --arch aarch64 --cpu 3 --memory 6 --disk 30 --runtime docker
-          colima status
-          docker version
-
-      - name: Reconstruct and execute one audited current lane
-        id: smoke
-        continue-on-error: true
+      - name: Reconstruct exact v22 harness and export excerpts
         shell: bash
         env:
           WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
         run: |
           set -euo pipefail
-          test "$(shasum -a 256 scripts/aspire-v21-noninteractive-cert-harness.py | awk '{print $1}')" = \
-            'b290de46fe9a6eeb2bc78970e1689b2fabb5b241e353925dbe53bd79396da43d'
-          test "$(shasum -a 256 scripts/aspire-v22-fifo-cli-harness.py | awk '{print $1}')" = \
-            '57fed824243c643374ca391f58311d94c65d770a0928f08f5b7c9c0905d31f3e'
-          python3 -m py_compile \
-            scripts/aspire-v21-noninteractive-cert-harness.py \
-            scripts/aspire-v22-fifo-cli-harness.py
+          umask 077
+          mkdir -p exported
 
-          cp scripts/aspire-v20-patch-chain-gate.sh /tmp/aspire-v22-reconstruct.sh
-          python3 - /tmp/aspire-v22-reconstruct.sh <<'PY_KEEP'
+          cp scripts/aspire-v20-patch-chain-gate.sh /tmp/aspire-v23-reconstruct.sh
+          python3 - /tmp/aspire-v23-reconstruct.sh <<'PY_KEEP'
           from pathlib import Path
           import sys
           p=Path(sys.argv[1]); s=p.read_text(); old='trap cleanup EXIT\n'
           if s.count(old)!=1: raise SystemExit(f'cleanup trap count={s.count(old)}')
-          p.write_text(s.replace(old,'# cleanup deferred for exact smoke execution\n',1))
+          p.write_text(s.replace(old,'# cleanup deferred for exact excerpt export\n',1))
           PY_KEEP
-          chmod 700 /tmp/aspire-v22-reconstruct.sh
-          /tmp/aspire-v22-reconstruct.sh
+          chmod 700 /tmp/aspire-v23-reconstruct.sh
+          /tmp/aspire-v23-reconstruct.sh
 
           RUN=patched-v13/run.sh
           BROWSER=patched-v13/browser.js
-          test "$(shasum -a 256 "$RUN" | awk '{print $1}')" = \
-            '55c6470e32a2ed5602ff0a450a587966ad6f40b9a5b88eb7a4d3514edf235906'
-          test "$(shasum -a 256 "$BROWSER" | awk '{print $1}')" = \
-            'e9e33b5ef3a3f3f08779af526bd91fa633f0f52f2f4676d51eb8add2c4eeefbe'
-
-          python3 scripts/aspire-v21-noninteractive-cert-harness.py "$RUN" v21-cert-receipt.json
-          test "$(shasum -a 256 "$RUN" | awk '{print $1}')" = \
-            '1f3057ecc1dfe1e30affa959c06788447ac9844701f936288292b7e3ac359150'
-          python3 scripts/aspire-v22-fifo-cli-harness.py "$RUN" v22-fifo-receipt.json
-          V22_RUN_SHA="$(shasum -a 256 "$RUN" | awk '{print $1}')"
+          python3 scripts/aspire-v21-noninteractive-cert-harness.py "$RUN" exported/v21-cert-receipt.json >/dev/null
+          python3 scripts/aspire-v22-fifo-cli-harness.py "$RUN" exported/v22-fifo-receipt.json >/dev/null
           bash -n "$RUN"
           node --check "$BROWSER"
-          printf 'V22_RUN_SHA256=%s\n' "$V22_RUN_SHA"
 
-          cp "$RUN" smoke-run.sh
-          python3 - smoke-run.sh <<'PY_ONE_LANE'
-          from pathlib import Path
-          import sys
-          p=Path(sys.argv[1]); s=p.read_text()
-          start_marker='matrix_rc=0\n# Independent residual replication: only the mandatory first-patched/current/fix/revert lanes.\n'
-          final_marker='cleanup_lane "$WORK/"\nexit "$matrix_rc"\n'
-          if s.count(start_marker)!=1: raise SystemExit(f'matrix start count={s.count(start_marker)}')
-          if s.count(final_marker)<1: raise SystemExit('matrix final marker missing')
-          start=s.index(start_marker)
-          end=s.rindex(final_marker)+len(final_marker)
-          replacement='''matrix_rc=0
-          run_lane current_17_0_0_legacy 17.0.0 legacy 18600 positive frontend-exposed "" "" 10.0.404 net10.0 || matrix_rc=1
-          cleanup_lane "$WORK/"
-          exit "$matrix_rc"
-          '''
-          p.write_text(s[:start]+replacement+s[end:])
-          PY_ONE_LANE
-          bash -n smoke-run.sh
+          python3 - "$RUN" "$BROWSER" exported <<'PY_EXCERPT'
+          import hashlib, json, pathlib, re, sys
+          run_path=pathlib.Path(sys.argv[1]); browser_path=pathlib.Path(sys.argv[2]); out=pathlib.Path(sys.argv[3])
 
-          set +e
-          bash smoke-run.sh
-          RC=$?
-          set -e
-          printf 'SMOKE_RC=%s\n' "$RC" > smoke-status.txt
-          exit "$RC"
+          def emit_selected(path, patterns, before, after, dest):
+              lines=path.read_text().splitlines(); selected=set()
+              for i,line in enumerate(lines):
+                  if any(re.search(p,line,re.I) for p in patterns):
+                      selected.update(range(max(0,i-before),min(len(lines),i+after+1)))
+              blocks=[]; cur=[]; prev=None
+              for i in sorted(selected):
+                  if prev is None or i==prev+1: cur.append((i+1,lines[i]))
+                  else: blocks.append(cur); cur=[(i+1,lines[i])]
+                  prev=i
+              if cur: blocks.append(cur)
+              text=[]
+              for block in blocks:
+                  text.append(f'===== lines {block[0][0]}-{block[-1][0]} =====')
+                  text.extend(f'{n:05d}: {line}' for n,line in block)
+                  text.append('')
+              dest.write_text('\n'.join(text))
 
-      - name: Build redacted diagnostic artifact
-        if: always()
-        shell: bash
-        env:
-          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
-        run: |
-          set -euo pipefail
-          mkdir -p sanitized-smoke
-          root=evidence-aspire120006-macos-v20-trusted-yarp
-          if [[ -d "$root" ]]; then
-            python3 - "$root" sanitized-smoke <<'PY_SANITIZE'
-          import hashlib,json,pathlib,re,sys
-          root,out=map(pathlib.Path,sys.argv[1:]); out.mkdir(parents=True,exist_ok=True)
-          names={'status.txt','assertion.txt','readiness.txt','login-token-shape.json','post-browser-health.json','browser-result.json','browser.stdout','browser.stderr','apphost.log','apphost-tail.txt','build.log','dcp-scope-assertion.json','dcp-dashboard-services.json','dcp-services.json','dcp-tunnels.json','capture-meta.json','devcert-gate.txt','framework-lane.txt','container-ca-load.txt','yarp-tls-handshake.txt'}
-          pats=[
-            (re.compile(r'([?&](?:t|token|access_token|code)=)[^&\s"\']+',re.I),r'\1<REDACTED>'),
-            (re.compile(r'(?i)(ASPIRE_DASHBOARD_FRONTEND_BROWSERTOKEN=)[^\s"\']+'),r'\1<REDACTED>'),
-            (re.compile(r'(?im)^((?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-otlp-api-key)\s*:\s*).+$'),r'\1<REDACTED>'),
-            (re.compile(r'(?i)(\.Aspire\.Dashboard\.Auth[^=;\s"\']*=)[^;\s"\']+'),r'\1<REDACTED>')]
-          inv=[]
-          for src in sorted(root.rglob('*')):
-            if not src.is_file() or src.name not in names or src.stat().st_size>8*1024*1024: continue
-            data=src.read_bytes()
-            if b'\x00' in data[:8192]: continue
-            text=data.decode('utf-8','replace')
-            for p,r in pats:text=p.sub(r,text)
-            dst=out/src.relative_to(root);dst.parent.mkdir(parents=True,exist_ok=True);dst.write_text(text)
-            inv.append({'path':str(dst.relative_to(out)),'sha256':hashlib.sha256(dst.read_bytes()).hexdigest()})
-          (out/'INVENTORY.json').write_text(json.dumps(inv,indent=2,sort_keys=True)+'\n')
-          PY_SANITIZE
-          fi
-          cp smoke-status.txt sanitized-smoke/ 2>/dev/null || true
-          cp v21-cert-receipt.json v22-fifo-receipt.json sanitized-smoke/ 2>/dev/null || true
-          printf 'SMOKE_OUTCOME=%s\n' "$SMOKE_OUTCOME" > sanitized-smoke/workflow-status.txt
+          emit_selected(run_path,[
+              r'^run_lane\(\)',r'^cleanup_lane\(\)',r'APPHOST_START_FAILED',r'dashboardHttpsReady',
+              r'login-token-shape',r'launchSettings\.json',r'AppHost\.cs',r'AppHost\.csproj',
+              r'dotnet run',r'apphost_pid',r'frontend-exposed',r'BROWSERTOKEN',r'wait_ready',
+              r'curl .*dashboard',r'https://localhost',r'ASPIRE_DASHBOARD',r'browser-result',
+              r'linkedServiceOpened',r'cookieLeak',r'replayAuthenticated',r'stockLifecycle'
+          ],55,100,out/'run-excerpts.txt')
+          emit_selected(browser_path,[
+              r'cookieLeak',r'replayAuthenticated',r'linkedServiceOpened',r'stockLifecycle',
+              r'Stop',r'Start',r'endpoint',r'auth',r'cookie',r'dashboard'
+          ],35,70,out/'browser-excerpts.txt')
+          (out/'EXCERPT_METADATA.json').write_text(json.dumps({
+              'runSha256':hashlib.sha256(run_path.read_bytes()).hexdigest(),
+              'browserSha256':hashlib.sha256(browser_path.read_bytes()).hexdigest(),
+              'runLines':len(run_path.read_text().splitlines()),
+              'browserLines':len(browser_path.read_text().splitlines())
+          },indent=2,sort_keys=True)+'\n')
+          PY_EXCERPT
+
           if grep -RInaE --binary-files=without-match \
-            'Authorization:[[:space:]]*(Bearer|Basic)[[:space:]]+[^<]|Cookie:[[:space:]]*[^<]|Set-Cookie:[[:space:]]*[^<]|ASPIRE_DASHBOARD_FRONTEND_BROWSERTOKEN=[^<]|[?&](t|token|access_token|code)=[^<&[:space:]]+' sanitized-smoke; then
-            echo SECRET_SCAN=FAIL >&2; exit 91
+            'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|Authorization:[[:space:]]*(Bearer|Basic)[[:space:]]+[^<]|ASPIRE_DASHBOARD_FRONTEND_BROWSERTOKEN=[0-9a-f]{32}' exported; then
+            echo EXCERPT_SECRET_SCAN=FAIL >&2
+            exit 91
           fi
-          echo SECRET_SCAN=PASS
+          echo EXCERPT_SECRET_SCAN=PASS
 
-      - name: Upload redacted smoke diagnostics
-        if: always()
+      - name: Upload code excerpts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: aspire-v22-fifo-current-lane-smoke-${{ github.sha }}
-          path: sanitized-smoke
+          name: aspire-v23-v22-code-excerpts
+          path: exported
           if-no-files-found: error
           retention-days: 1
           compression-level: 9
-
-      - name: Enforce smoke result
-        if: always()
-        shell: bash
-        run: |
-          test '${{ steps.smoke.outcome }}' = success
