@@ -7,6 +7,7 @@ import pathlib
 import sys
 
 EXPECTED_INPUT_RUN_SHA256 = "c8b83bbf3aa91ba91b73771cabea69c521cdbd7fe6f21beed84191bf8635da9a"
+EXPECTED_OUTPUT_RUN_SHA256 = "15d852ebaab817a79954a0687d9dff18beb0efd6bd8c9a4dc44a2e426c40b2d7"
 
 
 def sha256(data: bytes) -> str:
@@ -54,6 +55,8 @@ def main() -> int:
     run_path.write_text(source, encoding="utf-8")
     after_bytes = run_path.read_bytes()
     after_sha = sha256(after_bytes)
+    if after_sha != EXPECTED_OUTPUT_RUN_SHA256:
+        raise SystemExit(f"unexpected v22 run output SHA-256: {after_sha}")
 
     receipt = {
         "schema": "aspire-v22-runtime-hardening-receipt-v1",
