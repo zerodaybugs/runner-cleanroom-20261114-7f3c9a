@@ -1,0 +1,58 @@
+name: Validate noninteractive macOS dev certificate trust
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/_temporary-aspire-v21-macos-devcert-gate-20261128.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  devcert-gate:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install exact .NET SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 10.0.404
+          cache: false
+
+      - name: Export and trust certificate without interactive prompt
+        shell: bash
+        run: |
+          set -euo pipefail
+          CERT_DIR="$RUNNER_TEMP/aspire-devcert-gate"
+          CERT_PEM="$CERT_DIR/aspire-devcert.crt"
+          CERT_KEY="$CERT_DIR/aspire-devcert.key"
+          mkdir -p "$CERT_DIR"
+
+          dotnet dev-certs https --clean
+          dotnet dev-certs https \
+            -ep "$CERT_PEM" \
+            --format PEM \
+            --no-password
+
+          test -s "$CERT_PEM"
+          test -s "$CERT_KEY"
+          openssl x509 -in "$CERT_PEM" -noout -subject -issuer -serial -fingerprint -sha256
+          openssl x509 -in "$CERT_PEM" -noout -checkend 3600
+          security add-trusted-cert \
+            -d \
+            -r trustRoot \
+            -k "$HOME/Library/Keychains/login.keychain-db" \
+            "$CERT_PEM"
+          security verify-cert -c "$CERT_PEM" -p ssl
+          security find-certificate -a -Z -c localhost "$HOME/Library/Keychains/login.keychain-db" | sed -n '1,120p'
+
+          CERT_SHA="$(shasum -a 256 "$CERT_PEM" | awk '{print $1}')"
+          KEY_SHA="$(shasum -a 256 "$CERT_KEY" | awk '{print $1}')"
+          printf 'CERT_SHA256=%s\nKEY_SHA256=%s\n' "$CERT_SHA" "$KEY_SHA"
+          echo NONINTERACTIVE_DEVCERT_GATE=PASS
