@@ -1,0 +1,189 @@
+name: Build Aspire residual source provenance proof
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-source-proof-20261128.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout evidence repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Fetch pinned Microsoft source and emit bounded proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p source-proof/raw source-proof/excerpts
+
+          FIRST_PATCHED_COMMIT=b33d222049f1ecc3bc7257ec07b622fe550b2580
+          CURRENT_COMMIT=2d325b13709752ba6d9a943635c5e2940a2530c0
+          FIX_COMMIT=f017f668fd6e0938e23058dc0450a1403f409809
+          BASE=https://raw.githubusercontent.com/microsoft/aspire
+
+          fetch_source() {
+            local commit="$1" path="$2" out="$3"
+            curl -fsSL --retry 4 --retry-delay 2 "$BASE/$commit/$path" -o "$out"
+            test -s "$out"
+          }
+
+          for lane in first current; do
+            if [[ "$lane" == first ]]; then commit="$FIRST_PATCHED_COMMIT"; else commit="$CURRENT_COMMIT"; fi
+            fetch_source "$commit" src/Aspire.Hosting/Dcp/DcpExecutor.cs \
+              "source-proof/raw/${lane}-DcpExecutor.cs"
+            fetch_source "$commit" src/Aspire.Hosting/Dcp/ContainerCreator.cs \
+              "source-proof/raw/${lane}-ContainerCreator.cs"
+            fetch_source "$commit" src/Aspire.Hosting/Dcp/DcpOptions.cs \
+              "source-proof/raw/${lane}-DcpOptions.cs"
+            fetch_source "$commit" src/Shared/KnownConfigNames.cs \
+              "source-proof/raw/${lane}-KnownConfigNames.cs"
+          done
+
+          curl -fsSL --retry 4 --retry-delay 2 \
+            "https://api.github.com/repos/microsoft/aspire/commits/$FIX_COMMIT" \
+            -H 'Accept: application/vnd.github+json' \
+            -o source-proof/raw/fix-commit.json
+          curl -fsSL --retry 4 --retry-delay 2 \
+            'https://api.github.com/repos/microsoft/aspire/releases/tags/v13.6.5' \
+            -H 'Accept: application/vnd.github+json' \
+            -o source-proof/raw/release-v13.6.5.json
+          curl -fsSL --retry 4 --retry-delay 2 \
+            'https://api.github.com/repos/microsoft/aspire/releases/tags/v17.0.0' \
+            -H 'Accept: application/vnd.github+json' \
+            -o source-proof/raw/release-v17.0.0.json
+
+          python3 - source-proof "$FIRST_PATCHED_COMMIT" "$CURRENT_COMMIT" "$FIX_COMMIT" <<'PY_PROOF'
+          from __future__ import annotations
+          import hashlib, json, pathlib, re, sys
+
+          root=pathlib.Path(sys.argv[1])
+          first,current,fix=sys.argv[2:]
+          raw=root/'raw'; excerpts=root/'excerpts'
+
+          def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
+          def extract(path, marker, before, after, out):
+              lines=path.read_text(encoding='utf-8').splitlines()
+              matches=[i for i,line in enumerate(lines) if marker in line]
+              if len(matches)!=1:
+                  raise SystemExit(f'{path}: marker {marker!r} count={len(matches)}')
+              i=matches[0]; start=max(0,i-before); end=min(len(lines),i+after+1)
+              text='\n'.join(f'{n+1:05d}: {lines[n]}' for n in range(start,end))+'\n'
+              out.write_text(text,encoding='utf-8')
+              return {'source':str(path.relative_to(root)),'marker':marker,'startLine':start+1,'endLine':end,'sha256':sha(out)}
+
+          records=[]
+          for lane in ('first','current'):
+              dcp=raw/f'{lane}-DcpExecutor.cs'
+              creator=raw/f'{lane}-ContainerCreator.cs'
+              opts=raw/f'{lane}-DcpOptions.cs'
+              config=raw/f'{lane}-KnownConfigNames.cs'
+              records.append(extract(
+                  dcp,
+                  'Legacy (no tunnel) mode: we are going to just proxy all host endpoint into the container network.',
+                  12,45,excerpts/f'{lane}-legacy-all-host-endpoints.txt'))
+              records.append(extract(
+                  creator,
+                  'if (_options.Value.EnableAspireContainerTunnel)',
+                  22,74,excerpts/f'{lane}-tunnel-enabled-dashboard-filter.txt'))
+              records.append(extract(
+                  opts,
+                  'public bool EnableAspireContainerTunnel { get; set; } = true;',
+                  12,18,excerpts/f'{lane}-container-tunnel-option.txt'))
+              records.append(extract(
+                  config,
+                  'EnableContainerTunnel',
+                  8,14,excerpts/f'{lane}-container-tunnel-config-name.txt'))
+
+          release13=json.loads((raw/'release-v13.6.5.json').read_text())
+          release17=json.loads((raw/'release-v17.0.0.json').read_text())
+          commit=json.loads((raw/'fix-commit.json').read_text())
+          assert release13['target_commitish']==first, (release13['target_commitish'],first)
+          assert release17['target_commitish']==current, (release17['target_commitish'],current)
+          assert commit['sha']==fix, (commit['sha'],fix)
+
+          diff=[]
+          for entry in commit.get('files',[]):
+              if entry.get('filename') in {
+                  'src/Aspire.Hosting/Dcp/ContainerCreator.cs',
+                  'tests/Aspire.Hosting.Tests/Dcp/DcpExecutorTests.cs',
+                  'src/Aspire.Hosting/ApplicationModel/ExecutableResource.cs'
+              }:
+                  diff.append({
+                      'filename':entry.get('filename'),
+                      'status':entry.get('status'),
+                      'additions':entry.get('additions'),
+                      'deletions':entry.get('deletions'),
+                      'patch':entry.get('patch')
+                  })
+          (excerpts/'fix-commit-selected-diff.json').write_text(
+              json.dumps(diff,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+
+          proof={
+              'schema':'aspire-cve-2026-120006-residual-source-proof-v1',
+              'repository':'microsoft/aspire',
+              'firstPatched':{
+                  'version':'13.6.5','commit':first,
+                  'releasePublishedAt':release13['published_at'],
+                  'releaseImmutable':release13.get('immutable')
+              },
+              'current':{
+                  'version':'17.0.0','commit':current,
+                  'releasePublishedAt':release17['published_at'],
+                  'releaseImmutable':release17.get('immutable')
+              },
+              'originalFix':{
+                  'commit':fix,
+                  'subject':commit['commit']['message'].splitlines()[0]
+              },
+              'sourceObservations':[
+                  'Both 13.6.5 and 17.0.0 retain a legacy tunnel-disabled branch that enumerates every host resource endpoint.',
+                  'The Dashboard endpoint narrowing added for CVE-2026-120006 is guarded by EnableAspireContainerTunnel.',
+                  'EnableAspireContainerTunnel remains a supported configuration option and defaults to true.',
+                  'Dynamic validation is required to establish whether the retained branch preserves the original authority chain.'
+              ],
+              'excerpts':records,
+              'rawFiles':[
+                  {'path':str(p.relative_to(root)),'sha256':sha(p),'bytes':p.stat().st_size}
+                  for p in sorted(raw.glob('*')) if p.is_file()
+              ]
+          }
+          (root/'SOURCE_PROOF.json').write_text(json.dumps(proof,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+
+          sums=[]
+          for p in sorted(root.rglob('*')):
+              if p.is_file() and p.name!='SHA256SUMS.txt':
+                  sums.append(f'{sha(p)}  {p.relative_to(root)}')
+          (root/'SHA256SUMS.txt').write_text('\n'.join(sums)+'\n',encoding='utf-8')
+          print(json.dumps({
+              'firstPatchedCommit':first,
+              'currentCommit':current,
+              'fixCommit':fix,
+              'excerpts':len(records),
+              'status':'PASS'
+          },sort_keys=True))
+          PY_PROOF
+
+          python3 -m json.tool source-proof/SOURCE_PROOF.json >/dev/null
+          grep -Fq 'Legacy (no tunnel) mode' source-proof/excerpts/first-legacy-all-host-endpoints.txt
+          grep -Fq 'Legacy (no tunnel) mode' source-proof/excerpts/current-legacy-all-host-endpoints.txt
+          grep -Fq 'EnableAspireContainerTunnel' source-proof/excerpts/first-tunnel-enabled-dashboard-filter.txt
+          grep -Fq 'EnableAspireContainerTunnel' source-proof/excerpts/current-tunnel-enabled-dashboard-filter.txt
+          sha256sum -c source-proof/SHA256SUMS.txt
+          echo ASPIRE_SOURCE_PROOF=PASS
+
+      - name: Upload source provenance proof
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aspire-cve120006-residual-source-proof
+          path: source-proof
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 9
