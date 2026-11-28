@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -52,8 +51,7 @@ def main() -> None:
     new_devcert = r'''DEV_CERT_PFX="$CERT_DIR/aspire-devcert.pfx"
 DEV_CERT_KEY="$CERT_DIR/aspire-devcert.key"
 DEV_CERT_PFX_PASS="$(openssl rand -hex 24)"
-DEV_CERT_KEYCHAIN="$CERT_DIR/aspire-ci.keychain-db"
-DEV_CERT_KEYCHAIN_PASS="$(openssl rand -hex 24)"
+DEV_CERT_SYSTEM_KEYCHAIN=/Library/Keychains/System.keychain
 python3 - "$DEV_CERT_PFX" "$DEV_CERT_PFX_PASS" "$EVIDENCE/devcert-create-export.log" <<'PY_DEVCERT_EXPORT'
 import subprocess,sys
 pfx,password,log_path=sys.argv[1:]
@@ -70,27 +68,23 @@ openssl pkcs12 -in "$DEV_CERT_PFX" -passin "pass:$DEV_CERT_PFX_PASS" -clcerts -n
 openssl pkcs12 -in "$DEV_CERT_PFX" -passin "pass:$DEV_CERT_PFX_PASS" -nocerts -nodes -out "$DEV_CERT_KEY"
 test -s "$DEV_CERT_PEM"
 test -s "$DEV_CERT_KEY"
-python3 - "$DEV_CERT_KEYCHAIN" "$DEV_CERT_KEYCHAIN_PASS" "$DEV_CERT_PFX" "$DEV_CERT_PFX_PASS" "$DEV_CERT_PEM" "$HOME/Library/Keychains/login.keychain-db" "$EVIDENCE/devcert-keychain.log" <<'PY_DEVCERT_KEYCHAIN'
+DEV_CERT_SHA1="$(openssl x509 -in "$DEV_CERT_PEM" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')"
+test "${#DEV_CERT_SHA1}" = 40
+python3 - "$DEV_CERT_PEM" "$DEV_CERT_SYSTEM_KEYCHAIN" "$EVIDENCE/devcert-system-keychain.log" <<'PY_DEVCERT_SYSTEM_KEYCHAIN'
 import subprocess,sys
-keychain,keychain_password,pfx,pfx_password,cert,login_keychain,log_path=sys.argv[1:]
+cert,keychain,log_path=sys.argv[1:]
 commands=[
-    ['security','create-keychain','-p',keychain_password,keychain],
-    ['security','unlock-keychain','-p',keychain_password,keychain],
-    ['security','set-keychain-settings','-lut','21600',keychain],
-    ['security','list-keychains','-d','user','-s',keychain,login_keychain],
-    ['security','default-keychain','-d','user','-s',keychain],
-    ['security','import',pfx,'-k',keychain,'-P',pfx_password,'-A'],
-    ['security','add-trusted-cert','-d','-r','trustRoot','-k',keychain,cert],
+    ['sudo','-n','security','add-trusted-cert','-d','-r','trustRoot','-k',keychain,cert],
     ['security','verify-cert','-c',cert,'-p','ssl'],
 ]
 with open(log_path,'w',encoding='utf-8') as log:
-    for command in commands:
-        log.write('$ ' + ' '.join(command[:2] + ['<redacted>' if i > 1 and command[0] == 'security' and command[1] in {'create-keychain','unlock-keychain'} else value for i,value in enumerate(command[2:],start=2)]) + '\n')
+    for index,command in enumerate(commands,1):
+        log.write(f'COMMAND_{index}={" ".join(command[:4])}\n')
         log.flush()
-        subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=60)
-PY_DEVCERT_KEYCHAIN
+        subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=45)
+PY_DEVCERT_SYSTEM_KEYCHAIN
 openssl x509 -in "$DEV_CERT_PEM" -noout -subject -issuer -serial -fingerprint -sha256 > "$EVIDENCE/devcert-metadata.txt"
-security find-certificate -a -Z -c localhost "$DEV_CERT_KEYCHAIN" >> "$EVIDENCE/devcert-metadata.txt" 2>&1 || true'''
+printf 'SYSTEM_KEYCHAIN=%s\nCERT_SHA1=%s\n' "$DEV_CERT_SYSTEM_KEYCHAIN" "$DEV_CERT_SHA1" >> "$EVIDENCE/devcert-metadata.txt"'''
     source = source.replace(old_devcert, new_devcert, 1)
 
     start_marker = "matrix_rc=0\n# Independent residual replication: only the mandatory first-patched/current/fix/revert lanes."
@@ -139,25 +133,33 @@ fi
     }
     source = source[:start] + lane_blocks[lane] + source[end:]
 
-    if source.count("--trust --format PEM") != 0:
+    if "--trust --format PEM" in source:
         die("interactive dev-certs trust flag remains")
     if source.count("V21 parallel lane:") != 1:
         die("lane replacement count mismatch")
     if "--ignore-certificate-errors" in source:
         die("forbidden Chromium trust bypass present")
+    if "sudo -n security add-trusted-cert" not in source:
+        die("validated system-keychain trust command missing")
 
     output = source.encode("utf-8")
     run_path.write_bytes(output)
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
     receipt = {
-        "schema": 1,
+        "schema": 2,
         "lane": lane,
-        "scope": "CI partitioning and noninteractive macOS certificate trust only; product source, browser exploit logic, security assertions, and fix semantics unchanged",
+        "scope": "CI partitioning and noninteractive macOS System.keychain trust only; product source, browser exploit logic, security assertions, and fix semantics unchanged",
         "inputRunSha256": before_sha,
         "outputRunSha256": sha256_bytes(output),
+        "certificateTrust": {
+            "store": "/Library/Keychains/System.keychain",
+            "addCommand": "sudo -n security add-trusted-cert",
+            "browserBypass": False,
+            "validatedByRunId": 46173931175,
+        },
         "changes": [
-            "replace interactive dotnet dev-certs --trust with bounded PFX export and an unlocked ephemeral macOS keychain",
-            "import the same development-certificate identity and mark its public certificate trusted for SSL",
+            "replace interactive dotnet dev-certs --trust with bounded PFX export",
+            "mark the exported public development certificate trusted in the macOS System.keychain using passwordless sudo",
             "select exactly one independent residual lane group per macOS job",
             "preserve stock Dashboard navigation, cookie replay, lifecycle sink, natural-fix assertion, and stock-revert assertion",
         ],
