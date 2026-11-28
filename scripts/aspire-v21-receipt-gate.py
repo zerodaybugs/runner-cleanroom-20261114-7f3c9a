@@ -27,10 +27,20 @@ def main() -> None:
     if len(hashes) != len(EXPECTED_LANES):
         raise SystemExit("partition output hashes are not unique")
     for receipt in receipts:
+        lane = receipt.get("lane")
         if receipt.get("inputRunSha256") != EXPECTED_INPUT_SHA256:
-            raise SystemExit(f"unexpected input hash for {receipt.get('lane')}")
-        if receipt.get("schema") != 1:
-            raise SystemExit(f"unexpected schema for {receipt.get('lane')}")
+            raise SystemExit(f"unexpected input hash for {lane}")
+        if receipt.get("schema") != 2:
+            raise SystemExit(f"unexpected schema for {lane}")
+        trust = receipt.get("certificateTrust") or {}
+        if trust.get("store") != "/Library/Keychains/System.keychain":
+            raise SystemExit(f"unexpected trust store for {lane}")
+        if trust.get("addCommand") != "sudo -n security add-trusted-cert":
+            raise SystemExit(f"unexpected trust command for {lane}")
+        if trust.get("browserBypass") is not False:
+            raise SystemExit(f"browser trust bypass detected for {lane}")
+        if trust.get("validatedByRunId") != 46173931175:
+            raise SystemExit(f"unvalidated certificate method for {lane}")
     print(json.dumps(receipts, indent=2, sort_keys=True))
 
 
