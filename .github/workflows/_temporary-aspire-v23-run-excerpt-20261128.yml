@@ -1,0 +1,108 @@
+name: Export Aspire v22 launch and readiness excerpts
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v23-run-excerpt-20261128.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export-excerpts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout sealed inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Reconstruct exact v22 harness and export code excerpts
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p exported
+
+          cp scripts/aspire-v20-patch-chain-gate.sh /tmp/aspire-v23-reconstruct.sh
+          python3 - /tmp/aspire-v23-reconstruct.sh <<'PY_KEEP'
+          from pathlib import Path
+          import sys
+          p=Path(sys.argv[1]); s=p.read_text(); old='trap cleanup EXIT\n'
+          if s.count(old)!=1: raise SystemExit(f'cleanup trap count={s.count(old)}')
+          p.write_text(s.replace(old,'# cleanup deferred for exact excerpt export\n',1))
+          PY_KEEP
+          chmod 700 /tmp/aspire-v23-reconstruct.sh
+          /tmp/aspire-v23-reconstruct.sh
+
+          RUN=patched-v13/run.sh
+          BROWSER=patched-v13/browser.js
+          python3 scripts/aspire-v21-noninteractive-cert-harness.py "$RUN" exported/v21-cert-receipt.json >/dev/null
+          python3 scripts/aspire-v22-fifo-cli-harness.py "$RUN" exported/v22-fifo-receipt.json >/dev/null
+          bash -n "$RUN"
+          node --check "$BROWSER"
+
+          python3 - "$RUN" "$BROWSER" exported <<'PY_EXCERPT'
+          import hashlib, json, pathlib, re, sys
+          run_path=pathlib.Path(sys.argv[1]); browser_path=pathlib.Path(sys.argv[2]); out=pathlib.Path(sys.argv[3])
+          out.mkdir(parents=True,exist_ok=True)
+
+          def emit_selected(path, patterns, before, after, dest):
+              lines=path.read_text().splitlines()
+              selected=set()
+              for i,line in enumerate(lines):
+                  if any(re.search(p,line,re.I) for p in patterns):
+                      selected.update(range(max(0,i-before),min(len(lines),i+after+1)))
+              blocks=[]; cur=[]; prev=None
+              for i in sorted(selected):
+                  if prev is None or i==prev+1:
+                      cur.append((i+1,lines[i]))
+                  else:
+                      blocks.append(cur); cur=[(i+1,lines[i])]
+                  prev=i
+              if cur: blocks.append(cur)
+              text=[]
+              for block in blocks:
+                  text.append(f'===== lines {block[0][0]}-{block[-1][0]} =====')
+                  text.extend(f'{n:05d}: {line}' for n,line in block)
+                  text.append('')
+              dest.write_text('\n'.join(text))
+
+          emit_selected(run_path,[
+              r'^run_lane\(\)',r'^cleanup_lane\(\)',r'APPHOST_START_FAILED',r'dashboardHttpsReady',
+              r'login-token-shape',r'launchSettings\.json',r'AppHost\.cs',r'AppHost\.csproj',
+              r'dotnet run',r'apphost_pid',r'frontend-exposed',r'BROWSERTOKEN',r'wait_ready',
+              r'curl .*dashboard',r'https://localhost',r'ASPIRE_DASHBOARD',r'browser-result',
+              r'linkedServiceOpened',r'cookieLeak',r'replayAuthenticated',r'stockLifecycle'
+          ],45,85,out/'run-excerpts.txt')
+          emit_selected(browser_path,[
+              r'cookieLeak',r'replayAuthenticated',r'linkedServiceOpened',r'stockLifecycle',
+              r'Stop',r'Start',r'endpoint',r'auth',r'cookie',r'dashboard'
+          ],30,60,out/'browser-excerpts.txt')
+          meta={
+              'runSha256':hashlib.sha256(run_path.read_bytes()).hexdigest(),
+              'browserSha256':hashlib.sha256(browser_path.read_bytes()).hexdigest(),
+              'runLines':len(run_path.read_text().splitlines()),
+              'browserLines':len(browser_path.read_text().splitlines()),
+          }
+          (out/'EXCERPT_METADATA.json').write_text(json.dumps(meta,indent=2,sort_keys=True)+'\n')
+          PY_EXCERPT
+
+          if grep -RInaE --binary-files=without-match \
+            'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|Authorization:[[:space:]]*(Bearer|Basic)[[:space:]]+[^<]|ASPIRE_DASHBOARD_FRONTEND_BROWSERTOKEN=[0-9a-f]{32}' exported; then
+            echo 'EXCERPT_SECRET_SCAN=FAIL' >&2
+            exit 91
+          fi
+          echo EXCERPT_SECRET_SCAN=PASS
+
+      - name: Upload code excerpts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aspire-v23-v22-code-excerpts
+          path: exported
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
