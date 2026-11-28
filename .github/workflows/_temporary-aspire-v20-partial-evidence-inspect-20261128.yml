@@ -1,4 +1,5 @@
 name: Inspect cancelled Aspire v20 evidence safely
+# trigger: bootstrap-trace-r2
 
 on:
   push:
@@ -80,6 +81,20 @@ jobs:
           for f in "$ROOT/workflow-status.txt" "$ROOT/bootstrap-status.txt" "$ROOT/status.txt"; do
             if [[ -f "$f" ]]; then echo "--- ${f#$ROOT/}"; sed -n '1,120p' "$f"; fi
           done
+          echo '=== PATCH RECEIPTS ==='
+          for f in "$ROOT"/HARNESS_V16_PATCH.json "$ROOT"/HARNESS_V18_DIRECT_PATCH.json "$ROOT"/HARNESS_V20_PATCH.json "$ROOT"/HARNESS_V20_PATCH.stdout "$ROOT"/HARNESS_V20_PATCH.stderr; do
+            if [[ -f "$f" ]]; then
+              echo "--- ${f#$ROOT/}"
+              sed -n '1,240p' "$f" | sed -E 's/([Cc]ookie|[Tt]oken|[Ss]ecret|[Pp]assword|[Aa]uthorization)[=: ]+[^ ]+/\1=<redacted>/g'
+            fi
+          done
+          echo '=== REDACTED BOOTSTRAP TRACE ==='
+          if [[ -f "$ROOT/bootstrap-trace.log" ]]; then
+            sed -E \
+              -e 's/([Cc]ookie|[Tt]oken|[Ss]ecret|[Pp]assword|[Aa]uthorization)[=: ]+[^ ]+/\1=<redacted>/g' \
+              -e 's/(login\?t=)[-A-Za-z0-9_]+/\1<redacted>/g' \
+              "$ROOT/bootstrap-trace.log" | tail -500
+          fi
           echo '=== LANE DECISION FILES ==='
           find "$ROOT" -mindepth 2 -maxdepth 3 -type f \( \
             -name status.txt -o \
