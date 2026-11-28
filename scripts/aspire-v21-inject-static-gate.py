@@ -22,7 +22,7 @@ for lane in first_patched current_net10_revert current_net11 natural_fix; do
     "$V21_STATIC_DIR/receipt-$lane.json"
   bash -n "$V21_STATIC_DIR/run-$lane.sh"
   python3 -m json.tool "$V21_STATIC_DIR/receipt-$lane.json" >/dev/null
-  grep -Fq 'security add-trusted-cert' "$V21_STATIC_DIR/run-$lane.sh"
+  grep -Fq "['sudo','-n','security','add-trusted-cert'" "$V21_STATIC_DIR/run-$lane.sh"
   grep -Fq '# V21 parallel lane:' "$V21_STATIC_DIR/run-$lane.sh"
   if grep -Fq -- '--trust --format PEM' "$V21_STATIC_DIR/run-$lane.sh"; then
     echo "interactive trust remains in $lane" >&2
