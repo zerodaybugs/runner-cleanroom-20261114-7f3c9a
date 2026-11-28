@@ -1,5 +1,5 @@
-name: Validate temporary macOS keychain for Aspire TLS
-# trigger: bounded-security-commands-r2
+name: Validate system-keychain trust for Aspire TLS
+# trigger: system-keychain-r3
 
 on:
   push:
@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 jobs:
-  temp-keychain-gate:
+  system-keychain-gate:
     runs-on: macos-15
     timeout-minutes: 20
     steps:
@@ -30,14 +30,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ROOT="$RUNNER_TEMP/aspire-keychain-gate"
-          KEYCHAIN="$ROOT/aspire-ci.keychain-db"
-          KEYCHAIN_PASS="$(openssl rand -hex 24)"
+          ROOT="$RUNNER_TEMP/aspire-system-keychain-gate"
+          SYSTEM_KEYCHAIN=/Library/Keychains/System.keychain
           PFX_PASS="$(openssl rand -hex 24)"
           PFX="$ROOT/aspire-devcert.pfx"
           CERT_PEM="$ROOT/aspire-devcert.crt"
           KEY_PEM="$ROOT/aspire-devcert.key"
-          LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
           mkdir -p "$ROOT"
 
           python3 - <<'PY_TIMEOUT_CLEAN'
@@ -53,23 +51,19 @@ jobs:
           openssl pkcs12 -in "$PFX" -passin "pass:$PFX_PASS" -nocerts -nodes -out "$KEY_PEM"
           test -s "$CERT_PEM"
           test -s "$KEY_PEM"
+          CERT_SHA1="$(openssl x509 -in "$CERT_PEM" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')"
+          test "${#CERT_SHA1}" = 40
 
-          python3 - "$KEYCHAIN" "$KEYCHAIN_PASS" "$PFX" "$PFX_PASS" "$CERT_PEM" "$LOGIN_KEYCHAIN" "$ROOT/security-commands.log" <<'PY_SECURITY'
+          python3 - "$CERT_PEM" "$SYSTEM_KEYCHAIN" "$ROOT/security-commands.log" <<'PY_SECURITY'
           import subprocess,sys
-          keychain,keychain_password,pfx,pfx_password,cert,login_keychain,log_path=sys.argv[1:]
+          cert,keychain,log_path=sys.argv[1:]
           commands=[
-              ['security','create-keychain','-p',keychain_password,keychain],
-              ['security','unlock-keychain','-p',keychain_password,keychain],
-              ['security','set-keychain-settings','-lut','21600',keychain],
-              ['security','list-keychains','-d','user','-s',keychain,login_keychain],
-              ['security','default-keychain','-d','user','-s',keychain],
-              ['security','import',pfx,'-k',keychain,'-P',pfx_password,'-A'],
-              ['security','add-trusted-cert','-d','-r','trustRoot','-k',keychain,cert],
+              ['sudo','-n','security','add-trusted-cert','-d','-r','trustRoot','-k',keychain,cert],
               ['security','verify-cert','-c',cert,'-p','ssl'],
           ]
           with open(log_path,'w',encoding='utf-8') as log:
               for index,command in enumerate(commands,1):
-                  log.write(f'COMMAND_{index}={command[0]} {command[1]}\n')
+                  log.write(f'COMMAND_{index}={" ".join(command[:4])}\n')
                   log.flush()
                   subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=45)
           PY_SECURITY
@@ -88,7 +82,7 @@ jobs:
           cat > Program.cs <<'EOF_CS'
           var builder = WebApplication.CreateBuilder(args);
           var app = builder.Build();
-          app.MapGet("/", () => "ASPIRE_TEMP_KEYCHAIN_TLS_OK");
+          app.MapGet("/", () => "ASPIRE_SYSTEM_KEYCHAIN_TLS_OK");
           app.Run();
           EOF_CS
           dotnet build -v:minimal
@@ -98,17 +92,22 @@ jobs:
           export ASPNETCORE_Kestrel__Certificates__Default__Password="$PFX_PASS"
           nohup dotnet run --no-build > "$ROOT/kestrel.log" 2>&1 &
           WEB_PID=$!
-          trap 'kill "$WEB_PID" 2>/dev/null || true; security delete-keychain "$KEYCHAIN" 2>/dev/null || true' EXIT
+          cleanup() {
+            kill "$WEB_PID" 2>/dev/null || true
+            sudo -n security delete-certificate -Z "$CERT_SHA1" "$SYSTEM_KEYCHAIN" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
           for i in $(seq 1 60); do
             if /usr/bin/curl -fsS --connect-timeout 2 --max-time 4 https://localhost:17443/ > "$ROOT/response.txt"; then break; fi
             kill -0 "$WEB_PID" 2>/dev/null || { cat "$ROOT/kestrel.log"; exit 41; }
             sleep 1
           done
-          grep -Fxq ASPIRE_TEMP_KEYCHAIN_TLS_OK "$ROOT/response.txt"
+          grep -Fxq ASPIRE_SYSTEM_KEYCHAIN_TLS_OK "$ROOT/response.txt"
           openssl s_client -connect localhost:17443 -servername localhost -CAfile "$CERT_PEM" -verify_return_error </dev/null > "$ROOT/tls.txt" 2>&1
           grep -q 'Verify return code: 0 (ok)' "$ROOT/tls.txt"
-          printf 'CERT_SHA256=%s\nPFX_SHA256=%s\n' \
+          printf 'CERT_SHA1=%s\nCERT_SHA256=%s\nPFX_SHA256=%s\n' \
+            "$CERT_SHA1" \
             "$(shasum -a 256 "$CERT_PEM" | awk '{print $1}')" \
             "$(shasum -a 256 "$PFX" | awk '{print $1}')"
           sed -n '1,120p' "$ROOT/security-commands.log"
-          echo TEMP_KEYCHAIN_TLS_GATE=PASS
+          echo SYSTEM_KEYCHAIN_TLS_GATE=PASS
