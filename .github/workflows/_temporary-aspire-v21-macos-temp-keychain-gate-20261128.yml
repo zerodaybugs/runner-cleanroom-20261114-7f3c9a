@@ -1,0 +1,100 @@
+name: Validate temporary macOS keychain for Aspire TLS
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/_temporary-aspire-v21-macos-temp-keychain-gate-20261128.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  temp-keychain-gate:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install exact .NET SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 10.0.404
+          cache: false
+
+      - name: Build noninteractive certificate trust chain and prove HTTPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/aspire-keychain-gate"
+          KEYCHAIN="$ROOT/aspire-ci.keychain-db"
+          KEYCHAIN_PASS="$(openssl rand -hex 24)"
+          PFX_PASS="$(openssl rand -hex 24)"
+          PFX="$ROOT/aspire-devcert.pfx"
+          CERT_PEM="$ROOT/aspire-devcert.crt"
+          KEY_PEM="$ROOT/aspire-devcert.key"
+          mkdir -p "$ROOT"
+
+          python3 - <<'PY_TIMEOUT_CLEAN'
+          import subprocess
+          subprocess.run(['dotnet','dev-certs','https','--clean'],check=True,timeout=45)
+          PY_TIMEOUT_CLEAN
+          python3 - "$PFX" "$PFX_PASS" <<'PY_TIMEOUT_EXPORT'
+          import subprocess,sys
+          subprocess.run(['dotnet','dev-certs','https','-ep',sys.argv[1],'-p',sys.argv[2]],check=True,timeout=60)
+          PY_TIMEOUT_EXPORT
+          test -s "$PFX"
+          openssl pkcs12 -in "$PFX" -passin "pass:$PFX_PASS" -clcerts -nokeys -out "$CERT_PEM"
+          openssl pkcs12 -in "$PFX" -passin "pass:$PFX_PASS" -nocerts -nodes -out "$KEY_PEM"
+          test -s "$CERT_PEM"
+          test -s "$KEY_PEM"
+
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" "$HOME/Library/Keychains/login.keychain-db"
+          security default-keychain -d user -s "$KEYCHAIN"
+          security import "$PFX" -k "$KEYCHAIN" -P "$PFX_PASS" -A
+          security add-trusted-cert -d -r trustRoot -k "$KEYCHAIN" "$CERT_PEM"
+          security verify-cert -c "$CERT_PEM" -p ssl
+
+          mkdir -p "$ROOT/web"
+          cd "$ROOT/web"
+          cat > Gate.csproj <<'EOF_CSPROJ'
+          <Project Sdk="Microsoft.NET.Sdk.Web">
+            <PropertyGroup>
+              <TargetFramework>net10.0</TargetFramework>
+              <Nullable>enable</Nullable>
+              <ImplicitUsings>enable</ImplicitUsings>
+            </PropertyGroup>
+          </Project>
+          EOF_CSPROJ
+          cat > Program.cs <<'EOF_CS'
+          var builder = WebApplication.CreateBuilder(args);
+          var app = builder.Build();
+          app.MapGet("/", () => "ASPIRE_TEMP_KEYCHAIN_TLS_OK");
+          app.Run();
+          EOF_CS
+          dotnet build -v:minimal
+
+          export ASPNETCORE_URLS=https://localhost:17443
+          export ASPNETCORE_Kestrel__Certificates__Default__Path="$PFX"
+          export ASPNETCORE_Kestrel__Certificates__Default__Password="$PFX_PASS"
+          nohup dotnet run --no-build > "$ROOT/kestrel.log" 2>&1 &
+          WEB_PID=$!
+          trap 'kill "$WEB_PID" 2>/dev/null || true; security delete-keychain "$KEYCHAIN" 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if /usr/bin/curl -fsS --connect-timeout 2 --max-time 4 https://localhost:17443/ > "$ROOT/response.txt"; then break; fi
+            kill -0 "$WEB_PID" 2>/dev/null || { cat "$ROOT/kestrel.log"; exit 41; }
+            sleep 1
+          done
+          grep -Fxq ASPIRE_TEMP_KEYCHAIN_TLS_OK "$ROOT/response.txt"
+          openssl s_client -connect localhost:17443 -servername localhost -CAfile "$CERT_PEM" -verify_return_error </dev/null > "$ROOT/tls.txt" 2>&1
+          grep -q 'Verify return code: 0 (ok)' "$ROOT/tls.txt"
+          printf 'CERT_SHA256=%s\nPFX_SHA256=%s\n' \
+            "$(shasum -a 256 "$CERT_PEM" | awk '{print $1}')" \
+            "$(shasum -a 256 "$PFX" | awk '{print $1}')"
+          echo TEMP_KEYCHAIN_TLS_GATE=PASS
