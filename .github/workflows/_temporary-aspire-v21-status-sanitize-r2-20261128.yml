@@ -1,0 +1,130 @@
+name: Export redacted Aspire v21 lane statuses
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v21-status-sanitize-r2-20261128.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  export-status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout sealed inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Decrypt and redact lane diagnostics
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p work/artifact work/raw sanitized
+
+          printf '%s' "$WRAPPING_KEY_B64" | openssl base64 -d -A > work/wrapping.key
+          test "$(wc -c < work/wrapping.key | tr -d ' ')" = 32
+          openssl enc -d -aes-256-cbc \
+            -K "$(od -An -tx1 -v work/wrapping.key | tr -d ' \n')" \
+            -iv "$(tr -d '\r\n ' < bootstrap/private.iv.hex)" \
+            -in bootstrap/private.pem.enc \
+            -out work/private.pem
+          tr -d '\r\n ' < sealed/aspire-macos-matrix-v2.key.enc.b64 | \
+            openssl base64 -d -A > work/payload.key.enc
+          openssl pkeyutl -decrypt \
+            -inkey work/private.pem \
+            -in work/payload.key.enc \
+            -out work/runtime.key \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -pkeyopt rsa_mgf1_md:sha256
+          test "$(wc -c < work/runtime.key | tr -d ' ')" = 32
+
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/15256426239/zip" \
+            -o work/artifact.zip
+          unzip -q work/artifact.zip -d work/artifact
+          grep -qx 'RUN_ID=46125294353' work/artifact/metadata.txt
+          grep -qx 'SOURCE_SHA=5cc0733c02acfc45ce076a1be356ab544c825220' work/artifact/metadata.txt
+          test "$(sha256sum work/artifact/evidence.enc | awk '{print $1}')" = \
+            "$(tr -d '\r\n ' < work/artifact/evidence.cipher.sha256)"
+          openssl enc -d -aes-256-cbc \
+            -K "$(od -An -tx1 -v work/runtime.key | tr -d ' \n')" \
+            -iv "$(tr -d '\r\n ' < work/artifact/evidence.iv.hex)" \
+            -in work/artifact/evidence.enc \
+            -out work/evidence.zip
+          test "$(sha256sum work/evidence.zip | awk '{print $1}')" = \
+            "$(tr -d '\r\n ' < work/artifact/evidence.plain.sha256)"
+          unzip -q work/evidence.zip -d work/raw
+
+          python3 - work/raw sanitized work/artifact/metadata.txt <<'PY'
+          import hashlib, json, pathlib, re, shutil, sys
+          raw, out, meta = map(pathlib.Path, sys.argv[1:])
+          roots=[p for p in raw.iterdir() if p.is_dir()]
+          if len(roots)!=1: raise SystemExit(f'evidence roots={len(roots)}')
+          root=roots[0]
+          names={
+            'status.txt','assertion.txt','readiness.txt','workflow-status.txt','bootstrap-status.txt',
+            'devcert-gate.txt','framework-lane.txt','login-token-shape.json','post-browser-health.json',
+            'browser-result.json','browser.stdout','browser.stderr','apphost.log','apphost-tail.txt',
+            'build.log','dotnet-lane.txt','dcp-scope-assertion.json','dcp-dashboard-services.json',
+            'dcp-services.json','dcp-tunnels.json','docker-ps-a.txt','docker-ps-final.txt',
+            'capture-meta.json','matrix-summary.json','fix-build.log','fix-build-status.txt',
+            'revert-status.txt','natural-fix.patch','fix-dll.sha256','apphost-dll.sha256',
+            'aspire-hosting-before-replacement.sha256','aspire-hosting-loaded.sha256',
+            'exported-stock-dll.sha256','container-ca-load.txt','yarp-tls-handshake.txt',
+            'proxyless-service.json','victim-pids.txt','victim-pid-log-stat.txt'
+          }
+          patterns=[
+            (re.compile(r'([?&](?:t|token|access_token|code)=)[^&\s"\']+',re.I),r'\1<REDACTED>'),
+            (re.compile(r'(?i)(ASPIRE_DASHBOARD_FRONTEND_BROWSERTOKEN=)[^\s"\']+'),r'\1<REDACTED>'),
+            (re.compile(r'(?im)^((?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-otlp-api-key)\s*:\s*).+$'),r'\1<REDACTED>'),
+            (re.compile(r'(?i)(\.Aspire\.Dashboard\.Auth[^=;\s"\']*=)[^;\s"\']+'),r'\1<REDACTED>'),
+            (re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----',re.I|re.S),'<PRIVATE_KEY_REDACTED>')
+          ]
+          def clean(t):
+            for p,r in patterns:t=p.sub(r,t)
+            return t
+          inventory=[]
+          for src in sorted(root.rglob('*')):
+            if not src.is_file() or src.name not in names or src.stat().st_size>8*1024*1024: continue
+            data=src.read_bytes()
+            if b'\x00' in data[:8192]: continue
+            rel=src.relative_to(root); dst=out/rel; dst.parent.mkdir(parents=True,exist_ok=True)
+            text=clean(data.decode('utf-8','replace'))
+            dst.write_text(text)
+            inventory.append({'path':str(rel),'bytes':dst.stat().st_size,'sha256':hashlib.sha256(dst.read_bytes()).hexdigest()})
+          shutil.copyfile(meta,out/'ci-artifact-metadata.txt')
+          (out/'INVENTORY.json').write_text(json.dumps(inventory,indent=2,sort_keys=True)+'\n')
+          sums=[]
+          for p in sorted(out.rglob('*')):
+            if p.is_file() and p.name!='SHA256SUMS.txt':sums.append(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(out)}')
+          (out/'SHA256SUMS.txt').write_text('\n'.join(sums)+'\n')
+          print(json.dumps({'files':len(inventory)}))
+          PY
+
+          if grep -RInaE --binary-files=without-match \
+            'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|Authorization:[[:space:]]*(Bearer|Basic)[[:space:]]+[^<]|Cookie:[[:space:]]*[^<]|Set-Cookie:[[:space:]]*[^<]|ASPIRE_DASHBOARD_FRONTEND_BROWSERTOKEN=[^<]|[?&](t|token|access_token|code)=[^<&[:space:]]+' sanitized; then
+            echo 'SECRET_SCAN=FAIL' >&2
+            exit 91
+          fi
+          echo SECRET_SCAN=PASS
+          rm -rf work
+
+      - name: Upload redacted statuses
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aspire-v21-redacted-statuses-46125294353
+          path: sanitized
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
