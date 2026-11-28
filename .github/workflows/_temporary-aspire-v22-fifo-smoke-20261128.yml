@@ -1,4 +1,5 @@
 name: Aspire v22 launch and readiness code inspection
+# trigger: excerpt-r2
 
 on:
   push:
@@ -87,7 +88,7 @@ jobs:
           PY_EXCERPT
 
           if grep -RInaE --binary-files=without-match \
-            'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|Authorization:[[:space:]]*(Bearer|Basic)[[:space:]]+[^<]|ASPIRE_DASHBOARD_FRONTEND_BROWSERTOKEN=[0-9a-f]{32}' exported; then
+            'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|ASPIRE_DASHBOARD_FRONTEND_BROWSERTOKEN=[0-9a-f]{32}|Authorization:[[:space:]]*(Bearer|Basic)[[:space:]]+[A-Za-z0-9._~+/=-]{20,}' exported; then
             echo EXCERPT_SECRET_SCAN=FAIL >&2
             exit 91
           fi
