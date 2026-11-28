@@ -31,6 +31,15 @@ def main() -> int:
         raise SystemExit(f"generated checksum anchor count={source.count(checksum)}")
     source = source.replace(checksum, 'sha256sum "$GENERATED"\n', 1)
 
+    execution = 'WRAPPING_KEY_B64="$WRAPPING_KEY_B64" "$GENERATED"\n'
+    if source.count(execution) != 1:
+        raise SystemExit(f"generated execution anchor count={source.count(execution)}")
+    source = source.replace(
+        execution,
+        'WRAPPING_KEY_B64="$WRAPPING_KEY_B64" "./$GENERATED"\n',
+        1,
+    )
+
     path.write_text(source, encoding="utf-8")
     return 0
 
