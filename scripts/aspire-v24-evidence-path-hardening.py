@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 
 EXPECTED_INPUT_RUN_SHA256 = "15d852ebaab817a79954a0687d9dff18beb0efd6bd8c9a4dc44a2e426c40b2d7"
+EXPECTED_OUTPUT_RUN_SHA256 = "599cfc3200faa9e872b72f344716ef0fcd5f534c5a80454cf50197c2242eb484"
 
 
 def sha256(data: bytes) -> str:
@@ -42,6 +43,8 @@ mkdir -p "$WORK" "$EVIDENCE"
     run_path.write_text(source, encoding="utf-8")
     after = run_path.read_bytes()
     after_sha = sha256(after)
+    if after_sha != EXPECTED_OUTPUT_RUN_SHA256:
+        raise SystemExit(f"unexpected v24 run output SHA-256: {after_sha}")
 
     receipt = {
         "schema": "aspire-v24-evidence-path-hardening-receipt-v1",
