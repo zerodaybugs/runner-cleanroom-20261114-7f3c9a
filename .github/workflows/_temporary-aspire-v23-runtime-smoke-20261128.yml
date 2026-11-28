@@ -1,0 +1,175 @@
+name: Sealed Aspire CVE-2026-120006 macOS v23 runtime smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v23-runtime-smoke-20261128.yml'
+      - 'scripts/aspire-v23-bootstrap-apply.sh'
+      - 'scripts/aspire-v22-runtime-hardening.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-macos-smoke:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Checkout sealed clean-room inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install exact .NET SDK lanes
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: |
+            10.0.404
+            11.0.100
+          cache: false
+
+      - name: Install software-virtualized container runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install docker qemu colima
+          colima start --vm-type qemu --arch aarch64 --cpu 3 --memory 6 --disk 30 --runtime docker
+          colima status
+          docker version
+
+      - name: Execute instrumented current-versus-natural-fix smoke
+        id: execute
+        continue-on-error: true
+        shell: bash
+        env:
+          WRAPPING_KEY_B64: ${{ secrets.PAYLOAD_KEY_B64 }}
+          ZDB_MATRIX_PROFILE: smoke
+          ZDB_EVIDENCE_DIR: evidence-aspire120006-macos-v23-runtime-smoke
+        run: |
+          set -euo pipefail
+          test -n "$WRAPPING_KEY_B64"
+          test "$(shasum -a 256 scripts/aspire-v23-bootstrap-apply.sh | awk '{print $1}')" = \
+            'cc657c4a0ef0dd30d7b656c73867eb7ec79b4da28e84ab6c74588e6ffefe4d9b'
+          test "$(shasum -a 256 scripts/aspire-v22-runtime-hardening.py | awk '{print $1}')" = \
+            'ab2bc7836d66b492a81e88103a078c873562022741060b29b1581a1588224921'
+          bash -n scripts/aspire-v23-bootstrap-apply.sh
+          python3 -m py_compile scripts/aspire-v22-runtime-hardening.py
+          chmod 700 scripts/aspire-v23-bootstrap-apply.sh
+          scripts/aspire-v23-bootstrap-apply.sh
+
+      - name: Emit metadata-only diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          echo '=== EXACT SDK/RUNTIME ==='
+          dotnet --info | sed -n '1,140p' || true
+          echo '=== V23 SMOKE STATUS FILE PATHS ==='
+          find evidence-aspire120006-macos-v23-runtime-smoke -maxdepth 3 -type f \( \
+            -name status.txt -o \
+            -name assertion.txt -o \
+            -name readiness.txt -o \
+            -name post-browser-health.json -o \
+            -name login-token-shape.json -o \
+            -name framework-lane.txt -o \
+            -name dcp-scope-assertion.json -o \
+            -name browser-result.json -o \
+            -name fix-dll.sha256 -o \
+            -name workflow-status.txt -o \
+            -name executed-run-hashes.txt -o \
+            -name PATCH_CHAIN_CHECKPOINTS.txt -o \
+            -name apphost.log -o \
+            -name apphost-tail.txt \
+          \) -print 2>/dev/null | sort || true
+
+      - name: Seal v23 smoke evidence
+        if: always()
+        shell: bash
+        env:
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+          MATRIX_RC: ${{ steps.execute.outputs.matrix_rc }}
+          PATCHED_RUN_SHA: ${{ steps.execute.outputs.patched_run_sha }}
+          PATCHED_BROWSER_SHA: ${{ steps.execute.outputs.patched_browser_sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          EVIDENCE_DIR=evidence-aspire120006-macos-v23-runtime-smoke
+          mkdir -p sealed-evidence
+          if [[ ! -d "$EVIDENCE_DIR" ]]; then
+            mkdir -p "$EVIDENCE_DIR"
+            printf 'NO_EVIDENCE_DIRECTORY\n' > "$EVIDENCE_DIR/status.txt"
+          fi
+          printf 'EXECUTE_OUTCOME=%s\nMATRIX_RC=%s\n' "$EXECUTE_OUTCOME" "$MATRIX_RC" > "$EVIDENCE_DIR/workflow-status.txt"
+
+          {
+            echo 'FORMAT=ZDB-AES-256-CBC-PKCS7-V1'
+            echo 'TARGET=Aspire CVE-2026-120006 current-17 versus natural-fix macOS smoke v23'
+            echo 'PROFILE=smoke-current17-and-natural-fix-only'
+            echo "RUNNER=${{ runner.os }}-${{ runner.arch }}"
+            echo "RUN_ID=${{ github.run_id }}"
+            echo "SOURCE_SHA=${{ github.sha }}"
+            echo "EXECUTE_OUTCOME=$EXECUTE_OUTCOME"
+            echo "MATRIX_RC=$MATRIX_RC"
+            echo "PATCHED_RUN_SHA256=$PATCHED_RUN_SHA"
+            echo "PATCHED_BROWSER_SHA256=$PATCHED_BROWSER_SHA"
+            echo 'V23_BOOTSTRAP_SHA256=cc657c4a0ef0dd30d7b656c73867eb7ec79b4da28e84ab6c74588e6ffefe4d9b'
+            echo 'V22_RUNTIME_PATCHER_SHA256=ab2bc7836d66b492a81e88103a078c873562022741060b29b1581a1588224921'
+            echo 'FINAL_EXPECTED_RUN_SHA256=15d852ebaab817a79954a0687d9dff18beb0efd6bd8c9a4dc44a2e426c40b2d7'
+            echo 'FINAL_EXPECTED_BROWSER_SHA256=a5553a24a95f9bd1b4f340e5acdcd6ee8d63588d875700ce0024ed659005351e'
+            echo 'DISCOVERY=attacker-service referrer origin only; no injected Dashboard port'
+            echo 'READINESS_TRUST=exact exported development CA via curl --cacert'
+            echo 'BROWSER_TRUST=noninteractive macOS System Keychain import; no browser TLS bypass'
+            echo 'SINK=stock Aspire Dashboard Stop/Start lifecycle commands'
+          } > sealed-evidence/metadata.txt
+
+          if [[ -f matrix.runtime.key ]]; then
+            test "$(wc -c < matrix.runtime.key | tr -d ' ')" = 32
+            ditto -c -k --sequesterRsrc --keepParent "$EVIDENCE_DIR" evidence.plain.zip
+            PLAIN_SHA="$(shasum -a 256 evidence.plain.zip | awk '{print $1}')"
+            EVIDENCE_IV="$(openssl rand -hex 16)"
+            KEY_HEX="$(od -An -tx1 -v matrix.runtime.key | tr -d ' \n')"
+            openssl enc -aes-256-cbc \
+              -K "$KEY_HEX" \
+              -iv "$EVIDENCE_IV" \
+              -in evidence.plain.zip \
+              -out sealed-evidence/evidence.enc
+            printf '%s\n' "$EVIDENCE_IV" > sealed-evidence/evidence.iv.hex
+            printf '%s\n' "$PLAIN_SHA" > sealed-evidence/evidence.plain.sha256
+            shasum -a 256 sealed-evidence/evidence.enc | awk '{print $1}' > sealed-evidence/evidence.cipher.sha256
+            echo 'EVIDENCE_CIPHER_PRESENT=1' >> sealed-evidence/metadata.txt
+          else
+            echo 'EVIDENCE_CIPHER_PRESENT=0' >> sealed-evidence/metadata.txt
+            echo 'matrix.runtime.key was not created before failure' > sealed-evidence/no-runtime-key.txt
+          fi
+
+          rm -rf \
+            evidence.plain.zip \
+            "$EVIDENCE_DIR" \
+            evidence-aspire120006-macos-v13-ui-lifecycle \
+            evidence-aspire120006-macos-v20-trusted-yarp \
+            evidence-aspire120006-macos-v22-runtime-smoke \
+            private-payload overlay payload.zip payload.enc payload.key.enc \
+            overlay.enc.b64.norm overlay.enc overlay.key.enc overlay.runtime.key overlay.zip \
+            patch.enc.b64.norm patch.enc patch.key.enc patch.runtime.key patch.zip patch \
+            patched-v11 patched-v13 private.pem wrapping.key matrix.runtime.key \
+            v20-patch.enc.b64.norm v20-patch.enc v20-patch.key.enc v20-patch.runtime.key v20-patch.zip v20-patch \
+            v21-patch.enc.b64.norm v21-patch.enc v21-patch.key.enc v21-patch.runtime.key v21-patch.zip v21-patch
+
+      - name: Upload sealed v23 smoke evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aspire-cve120006-v23-runtime-smoke-${{ github.sha }}
+          path: sealed-evidence
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Enforce v23 smoke result
+        if: always()
+        shell: bash
+        run: |
+          if [[ '${{ steps.execute.outcome }}' != 'success' ]]; then
+            echo 'Aspire v23 smoke did not satisfy both current-stock and natural-fix lanes; inspect sealed evidence.'
+            exit 1
+          fi
