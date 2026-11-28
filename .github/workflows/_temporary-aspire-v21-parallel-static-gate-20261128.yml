@@ -1,5 +1,5 @@
 name: Validate Aspire v21 parallel lane patcher
-# trigger: complete-current-scripts-r5
+# trigger: bootstrap-chain-r6
 
 on:
   push:
@@ -10,6 +10,7 @@ on:
       - 'scripts/aspire-v21-lane-selector.py'
       - 'scripts/aspire-v21-inject-static-gate.py'
       - 'scripts/aspire-v21-receipt-gate.py'
+      - 'scripts/aspire-v21-bootstrap-patcher.py'
   workflow_dispatch:
 
 permissions:
@@ -32,18 +33,54 @@ jobs:
           python3 -m py_compile \
             scripts/aspire-v21-lane-selector.py \
             scripts/aspire-v21-inject-static-gate.py \
-            scripts/aspire-v21-receipt-gate.py
+            scripts/aspire-v21-receipt-gate.py \
+            scripts/aspire-v21-bootstrap-patcher.py
           cp scripts/aspire-v20-patch-chain-gate.sh /tmp/aspire-v20-reconstruct-v21.sh
           python3 scripts/aspire-v21-inject-static-gate.py /tmp/aspire-v20-reconstruct-v21.sh
           chmod 700 /tmp/aspire-v20-reconstruct-v21.sh
           /tmp/aspire-v20-reconstruct-v21.sh
+
+          mkdir -p v21-static/bootstrap
+          for lane in first_patched current_net10_revert current_net11 natural_fix; do
+            cp scripts/aspire-v13-bootstrap.sh "v21-static/bootstrap/bootstrap-$lane.sh"
+            python3 scripts/aspire-v21-bootstrap-patcher.py \
+              "v21-static/bootstrap/bootstrap-$lane.sh" \
+              "$lane" \
+              "v21-static/bootstrap/bootstrap-$lane.receipt.json"
+            bash -n "v21-static/bootstrap/bootstrap-$lane.sh"
+            python3 -m json.tool "v21-static/bootstrap/bootstrap-$lane.receipt.json" >/dev/null
+            grep -Fq "evidence-aspire120006-macos-v21-$lane" "v21-static/bootstrap/bootstrap-$lane.sh"
+            grep -Fq 'scripts/aspire-v21-lane-selector.py' "v21-static/bootstrap/bootstrap-$lane.sh"
+            grep -Fq 'stock Aspire Dashboard Stop/Start lifecycle commands' scripts/aspire-v20-patch-chain-gate.sh
+          done
+          python3 - <<'PY_BOOTSTRAP_ASSERT'
+          import json,pathlib
+          root=pathlib.Path('v21-static/bootstrap')
+          expected={
+              'first_patched':'c79e6cf67b64e7c733f7c238d1ec1911c3dc49f0118c01abecfd417251e69480',
+              'current_net10_revert':'93af3e00ec7f6135b89c41e76843acb4bf5ef7e15ead57f8a4cf9e0a20b0877f',
+              'current_net11':'94612be4876e7f5447c7e4e705cefcd4bf35019306149ded3759a1067fe10f81',
+              'natural_fix':'be2aca9a6fed4d546ab5a805ee8ea1be87c0729fbe3f15533f1b45134496c011',
+          }
+          receipts=[json.load(open(p)) for p in sorted(root.glob('*.receipt.json'))]
+          assert {r['lane'] for r in receipts} == set(expected)
+          for receipt in receipts:
+              lane=receipt['lane']
+              assert receipt['expectedFinalRunSha256']==expected[lane]
+              assert receipt['expectedFinalBrowserSha256']=='e9e33b5ef3a3f08779af526bd91fa633f0f52f2f4676d51eb8add2c4eeefbe'
+              assert receipt['evidenceDirectory']==f'evidence-aspire120006-macos-v21-{lane}'
+          print(json.dumps(receipts,indent=2,sort_keys=True))
+          PY_BOOTSTRAP_ASSERT
+          echo V21_BOOTSTRAP_STATIC_GATE=PASS
 
       - name: Upload metadata-only receipts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: aspire-v21-parallel-static-receipts
-          path: v21-static/receipt-*.json
+          path: |
+            v21-static/receipt-*.json
+            v21-static/bootstrap/*.receipt.json
           if-no-files-found: warn
           retention-days: 3
           compression-level: 6
