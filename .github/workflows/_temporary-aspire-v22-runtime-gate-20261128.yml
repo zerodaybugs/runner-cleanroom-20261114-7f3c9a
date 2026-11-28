@@ -7,6 +7,7 @@ on:
       - '.github/workflows/_temporary-aspire-v22-runtime-gate-20261128.yml'
       - 'scripts/aspire-v22-runtime-hardening.py'
       - 'scripts/aspire-v22-retain-v21-gate.py'
+      - 'scripts/aspire-v22-bootstrap-apply.sh'
   workflow_dispatch:
 
 permissions:
@@ -30,6 +31,7 @@ jobs:
           python3 -m py_compile \
             scripts/aspire-v22-retain-v21-gate.py \
             scripts/aspire-v22-runtime-hardening.py
+          bash -n scripts/aspire-v22-bootstrap-apply.sh
 
           cp scripts/aspire-v21-patch-chain-gate.sh \
             /tmp/aspire-v21-patch-chain-gate-retain.sh
@@ -60,6 +62,7 @@ jobs:
 
           printf 'V22_RETAIN_PATCHER_SHA256=%s\n' "$(sha256sum scripts/aspire-v22-retain-v21-gate.py | awk '{print $1}')"
           printf 'V22_RUNTIME_PATCHER_SHA256=%s\n' "$(sha256sum scripts/aspire-v22-runtime-hardening.py | awk '{print $1}')"
+          printf 'V22_BOOTSTRAP_SHA256=%s\n' "$(sha256sum scripts/aspire-v22-bootstrap-apply.sh | awk '{print $1}')"
           printf 'V22_OUTPUT_RUN_SHA256=%s\n' "$(sha256sum patched-v13/run.sh | awk '{print $1}')"
           echo V22_RUNTIME_GATE=PASS
 
