@@ -1,4 +1,4 @@
-name: Aspire v25 cache-prewarmed current-lane proof
+name: Aspire v26 bounded-readiness current-lane proof
 
 on:
   push:
@@ -13,7 +13,7 @@ permissions:
 jobs:
   current-lane-proof:
     runs-on: macos-15
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
       - name: Checkout sealed inputs
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -33,7 +33,7 @@ jobs:
           colima status
           docker version
 
-      - name: Execute audited cache-prewarmed current lane
+      - name: Execute audited bounded-readiness current lane
         id: execute
         shell: bash
         env:
@@ -49,21 +49,24 @@ jobs:
             'b290de46fe9a6eeb2bc78970e1689b2fabb5b241e353925dbe53bd79396da43d'
           test "$(shasum -a 256 scripts/aspire-v22-fifo-cli-harness.py | awk '{print $1}')" = \
             '57fed824243c643374ca391f58311d94c65d770a0928f08f5b7c9c0905d31f3e'
+          test "$(shasum -a 256 scripts/aspire-v26-slow-qemu-readiness-harness.py | awk '{print $1}')" = \
+            'e7f20809eeac7f4f595c388801d2b5ee006006933d79fd57e1dfe2b0828c492e'
           python3 -m py_compile \
             scripts/aspire-v21-noninteractive-cert-harness.py \
             scripts/aspire-v22-fifo-cli-harness.py \
-            scripts/aspire-v25-cache-prewarm-harness.py
+            scripts/aspire-v25-cache-prewarm-harness.py \
+            scripts/aspire-v26-slow-qemu-readiness-harness.py
 
-          cp scripts/aspire-v20-patch-chain-gate.sh /tmp/aspire-v25-reconstruct.sh
-          python3 - /tmp/aspire-v25-reconstruct.sh <<'PY_KEEP'
+          cp scripts/aspire-v20-patch-chain-gate.sh /tmp/aspire-v26-reconstruct.sh
+          python3 - /tmp/aspire-v26-reconstruct.sh <<'PY_KEEP'
           from pathlib import Path
           import sys
           p=Path(sys.argv[1]); s=p.read_text(); old='trap cleanup EXIT\n'
           if s.count(old)!=1: raise SystemExit(f'cleanup trap count={s.count(old)}')
-          p.write_text(s.replace(old,'# cleanup deferred for exact v25 execution\n',1))
+          p.write_text(s.replace(old,'# cleanup deferred for exact v26 execution\n',1))
           PY_KEEP
-          chmod 700 /tmp/aspire-v25-reconstruct.sh
-          /tmp/aspire-v25-reconstruct.sh
+          chmod 700 /tmp/aspire-v26-reconstruct.sh
+          /tmp/aspire-v26-reconstruct.sh
 
           RUN=patched-v13/run.sh
           BROWSER=patched-v13/browser.js
@@ -75,14 +78,17 @@ jobs:
           python3 scripts/aspire-v22-fifo-cli-harness.py "$RUN" "$RAW/v22-fifo-receipt.json" >/dev/null
           test "$(shasum -a 256 "$RUN" | awk '{print $1}')" = '7979c6301c1b012c165121fe0a496794b700e6e35f49a8b37abd459667196c41'
           python3 scripts/aspire-v25-cache-prewarm-harness.py "$RUN" "$RAW/v25-cache-receipt.json" > "$RAW/v25-final-run.sha256"
+          test "$(shasum -a 256 "$RUN" | awk '{print $1}')" = '5af1b8455d20c8a979fdc4c2798e07855c37e675ebd082014c2d3be98d98b718'
+          python3 scripts/aspire-v26-slow-qemu-readiness-harness.py "$RUN" "$RAW/v26-readiness-receipt.json" > "$RAW/v26-final-run.sha256"
           FINAL_RUN_SHA="$(shasum -a 256 "$RUN" | awk '{print $1}')"
-          test "$FINAL_RUN_SHA" = "$(tr -d '\r\n ' < "$RAW/v25-final-run.sha256")"
-          python3 - "$RAW/v25-cache-receipt.json" <<'PY_RECEIPT'
+          test "$FINAL_RUN_SHA" = "$(tr -d '\r\n ' < "$RAW/v26-final-run.sha256")"
+          python3 - "$RAW/v26-readiness-receipt.json" <<'PY_RECEIPT'
           import json, sys
           r=json.load(open(sys.argv[1]))
-          assert r['beforeSha256']=='7979c6301c1b012c165121fe0a496794b700e6e35f49a8b37abd459667196c41'
+          assert r['beforeSha256']=='5af1b8455d20c8a979fdc4c2798e07855c37e675ebd082014c2d3be98d98b718'
           assert r['afterSha256']
-          assert r['privateMaterialAddedToEvidence'] is False
+          assert r['securityPredicateChanged'] is False
+          assert r['successAssertionChanged'] is False
           PY_RECEIPT
           bash -n "$RUN"
           node --check "$BROWSER"
@@ -112,17 +118,18 @@ jobs:
           RC=$?
           set -e
           printf '%s\n' "$RC" > "$RAW/smoke.rc"
-          printf 'FINAL_RUN_SHA256=%s\nBROWSER_SHA256=%s\nV25_PATCHER_SHA256=%s\n' \
+          printf 'FINAL_RUN_SHA256=%s\nBROWSER_SHA256=%s\nV25_PATCHER_SHA256=%s\nV26_PATCHER_SHA256=%s\n' \
             "$FINAL_RUN_SHA" \
             "$(shasum -a 256 "$BROWSER" | awk '{print $1}')" \
-            "$(shasum -a 256 scripts/aspire-v25-cache-prewarm-harness.py | awk '{print $1}')" > "$RAW/harness-hashes.txt"
+            "$(shasum -a 256 scripts/aspire-v25-cache-prewarm-harness.py | awk '{print $1}')" \
+            "$(shasum -a 256 scripts/aspire-v26-slow-qemu-readiness-harness.py | awk '{print $1}')" > "$RAW/harness-hashes.txt"
 
           LANE=evidence-aspire120006-macos-v20-trusted-yarp/current_17_0_0_legacy
           mkdir -p "$RAW/lane"
           if [[ -d "$LANE" ]]; then
             find "$LANE" -maxdepth 2 -type f -print0 | while IFS= read -r -d '' f; do
               case "$(basename "$f")" in
-                status.txt|assertion.txt|readiness.txt|login-token-shape.json|post-browser-health.json|browser-result.json|browser.stdout|browser.stderr|apphost.log|apphost-tail.txt|build.log|dotnet-lane.txt|dcp-status.txt|dcp-dashboard-services.json|dcp-scope-assertion.json|capture-meta.json|framework-lane.txt|devcert-gate.txt|devcert-cache-gate.json|container-ca-load.txt|yarp-tls-handshake.txt|victim-pids.txt|victim-pid-log-stat.txt|docker-ps-a.txt|docker-ps-final.txt)
+                status.txt|assertion.txt|readiness.txt|login-token-shape.json|post-browser-health.json|browser-result.json|browser.stdout|browser.stderr|apphost.log|apphost-tail.txt|build.log|dotnet-lane.txt|dcp-status.txt|dcp-dashboard-services.json|dcp-scope-assertion.json|capture-meta.json|framework-lane.txt|devcert-gate.txt|devcert-cache-gate.json|container-ca-load.txt|yarp-tls-handshake.txt|victim-pids.txt|victim-pid-log-stat.txt|docker-ps-a.txt|docker-ps-final.txt|host-listeners.txt|container-*.log|container-*.state.json|container-*.ports.json)
                   cp "$f" "$RAW/lane/$(basename "$f")" 2>/dev/null || true
                   ;;
               esac
@@ -170,7 +177,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: aspire-v25-cache-prewarmed-current-lane
+          name: aspire-v26-bounded-readiness-current-lane
           path: smoke-safe
           if-no-files-found: error
           retention-days: 1
