@@ -1,0 +1,149 @@
+name: Aspire v25 macOS certificate-cache A/B smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_temporary-aspire-v25-cache-ab-smoke-20261128.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cache-ab-smoke:
+    runs-on: macos-15
+    timeout-minutes: 18
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install exact .NET SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 10.0.404
+          cache: false
+
+      - name: Run no-cache and cache-prewarmed startup lanes
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          ROOT="$RUNNER_TEMP/aspire-cache-ab"
+          SAFE=cache-ab-safe
+          rm -rf "$ROOT" "$SAFE" "$HOME/.aspire/dev-certs/https"
+          mkdir -p "$ROOT/AppHost/Properties" "$SAFE"
+
+          cat > "$ROOT/global.json" <<'EOF_GLOBAL'
+          {"sdk":{"version":"10.0.404","rollForward":"disable","allowPrerelease":false}}
+          EOF_GLOBAL
+          cat > "$ROOT/AppHost/AppHost.csproj" <<'EOF_CSPROJ'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+            <ItemGroup><PackageReference Include="Aspire.Hosting.AppHost" Version="17.0.0" /></ItemGroup>
+          </Project>
+          EOF_CSPROJ
+          cat > "$ROOT/AppHost/AppHost.cs" <<'EOF_CS'
+          var builder = DistributedApplication.CreateBuilder(args);
+          builder.AddExecutable("victim", "/bin/sh", ".").WithArgs("-c", "exec /bin/sleep 600");
+          builder.Build().Run();
+          EOF_CS
+          cat > "$ROOT/AppHost/Properties/launchSettings.json" <<'EOF_LAUNCH'
+          {"profiles":{"https":{"commandName":"Project","dotnetRunMessages":true,"launchBrowser":false,"applicationUrl":"https://localhost:19601;http://localhost:19602","environmentVariables":{"ASPNETCORE_ENVIRONMENT":"Development","DOTNET_ENVIRONMENT":"Development","ASPIRE_DASHBOARD_OTLP_ENDPOINT_URL":"https://localhost:19603","ASPIRE_RESOURCE_SERVICE_ENDPOINT_URL":"https://localhost:19604"}}}}
+          EOF_LAUNCH
+          cat > "$ROOT/AppHost/appsettings.json" <<'EOF_SETTINGS'
+          {"Logging":{"LogLevel":{"Default":"Information","Microsoft.AspNetCore":"Warning","Aspire.Hosting.Dcp":"Information"}}}
+          EOF_SETTINGS
+
+          cd "$ROOT/AppHost"
+          dotnet restore -v:minimal > "$SAFE/build.log" 2>&1
+          dotnet build --no-restore -v:minimal >> "$SAFE/build.log" 2>&1
+
+          CERTDIR="$ROOT/cert"
+          CERT="$CERTDIR/dev.crt"
+          KEY="$CERTDIR/dev.key"
+          mkdir -p "$CERTDIR"
+          dotnet dev-certs https --clean > "$SAFE/devcert-clean.log" 2>&1 || true
+          dotnet dev-certs https --export-path "$CERT" --format PEM --no-password > "$SAFE/devcert-export.log" 2>&1
+          test -s "$CERT" && test -s "$KEY"
+          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$CERT" > "$SAFE/system-trust.log" 2>&1
+          dotnet dev-certs https --check --trust > "$SAFE/trust-check.log" 2>&1
+          security verify-cert -c "$CERT" -p ssl -s localhost > "$SAFE/security-verify.log" 2>&1
+
+          run_lane() {
+            local name="$1" token pid ready=0
+            token="$(openssl rand -hex 16)"
+            local fifo="$ROOT/$name.stdin" log="$SAFE/$name.log"
+            rm -f "$fifo"; mkfifo -m 600 "$fifo"; exec 9<>"$fifo"
+            ASPIRE_DASHBOARD_FRONTEND_BROWSERTOKEN="$token" dotnet run --no-build --launch-profile https <&9 > "$log" 2>&1 &
+            pid=$!
+            rm -f "$fifo"
+            for i in $(seq 1 75); do
+              if curl -fsS --connect-timeout 1 --max-time 2 https://localhost:19601/ >/dev/null 2>&1; then ready=1; break; fi
+              kill -0 "$pid" 2>/dev/null || break
+              sleep 1
+            done
+            printf 'READY=%s\nPROCESS_ALIVE=%s\n' "$ready" "$(kill -0 "$pid" 2>/dev/null && echo 1 || echo 0)" > "$SAFE/$name.status"
+            pgrep -afil 'aspire|dcp|dashboard|AppHost' > "$SAFE/$name.processes" 2>/dev/null || true
+            lsof -nP -iTCP -sTCP:LISTEN > "$SAFE/$name.listeners" 2>&1 || true
+            cp -R "$HOME/.aspire/logs" "$SAFE/$name-cli-logs" 2>/dev/null || true
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 2
+            pkill -f "$ROOT/AppHost/bin/Debug/net10.0/AppHost" 2>/dev/null || true
+            pkill -f 'aspire run --project' 2>/dev/null || true
+            pkill -f 'dcp start-apiserver' 2>/dev/null || true
+            pkill -f 'dcp run-controllers' 2>/dev/null || true
+            pkill -f '/Aspire.Dashboard$' 2>/dev/null || true
+            exec 9>&-
+            sleep 1
+          }
+
+          rm -rf "$HOME/.aspire/dev-certs/https" "$HOME/.aspire/logs"
+          run_lane no-cache
+
+          THUMB="$(openssl x509 -in "$CERT" -noout -fingerprint -sha1 | sed -E 's/^.*=//' | tr -d ':\r\n' | tr '[:lower:]' '[:upper:]')"
+          LOOKUP="$(printf '%s' "$THUMB" | shasum -a 256 | awk '{print toupper($1)}')"
+          CACHE="$HOME/.aspire/dev-certs/https"
+          mkdir -p "$CACHE"; chmod 700 "$HOME/.aspire" "$HOME/.aspire/dev-certs" "$CACHE" 2>/dev/null || true
+          cp "$CERT" "$CACHE/$LOOKUP.crt"
+          cp "$KEY" "$CACHE/$LOOKUP.key"
+          chmod 600 "$CACHE/$LOOKUP.crt" "$CACHE/$LOOKUP.key"
+          CERTPUB="$(openssl x509 -in "$CACHE/$LOOKUP.crt" -pubkey -noout | openssl pkey -pubin -outform DER | shasum -a 256 | awk '{print $1}')"
+          KEYPUB="$(openssl pkey -in "$CACHE/$LOOKUP.key" -pubout -outform DER | shasum -a 256 | awk '{print $1}')"
+          test "$CERTPUB" = "$KEYPUB"
+          printf 'LOOKUP_LENGTH=%s\nCRT_MODE=%s\nKEY_MODE=%s\nPUBLIC_KEY_MATCH=1\n' \
+            "${#LOOKUP}" "$(stat -f '%Lp' "$CACHE/$LOOKUP.crt")" "$(stat -f '%Lp' "$CACHE/$LOOKUP.key")" > "$SAFE/cache-gate.txt"
+          rm -rf "$HOME/.aspire/logs"
+          run_lane cache-prewarmed
+
+          python3 - "$SAFE" <<'PY_REDACT'
+          import pathlib,re,sys
+          root=pathlib.Path(sys.argv[1])
+          pats=[
+            (re.compile(r'([?&](?:t|token|access_token|code)=)[^&\s"\'<>]+',re.I),r'\1<REDACTED>'),
+            (re.compile(r'(?im)^((?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-otlp-api-key)\s*:\s*).+$'),r'\1<REDACTED>'),
+            (re.compile(r'(?i)(ASPIRE_DASHBOARD_FRONTEND_BROWSERTOKEN=)[^\s"\']+'),r'\1<REDACTED>'),
+            (re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----',re.I|re.S),'<PRIVATE_KEY_REDACTED>')]
+          for p in root.rglob('*'):
+            if not p.is_file(): continue
+            data=p.read_bytes()
+            if b'\x00' in data[:8192]: p.unlink(); continue
+            text=data.decode('utf-8','replace')
+            for a,b in pats:text=a.sub(b,text)
+            p.write_text(text)
+          PY_REDACT
+
+          if grep -RInaE --binary-files=without-match 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|ASPIRE_DASHBOARD_FRONTEND_BROWSERTOKEN=[^<]|[?&](t|token|access_token|code)=[^<&[:space:]]+' "$SAFE"; then
+            echo SECRET_SCAN_FAIL >&2; exit 91
+          fi
+          (cd "$SAFE" && find . -type f -print0 | sort -z | xargs -0 shasum -a 256) > "$SAFE/SHA256SUMS.txt"
+          rm -rf "$ROOT" "$HOME/.aspire/dev-certs/https"
+
+      - name: Upload A/B evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aspire-v25-cache-ab-smoke
+          path: cache-ab-safe
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
